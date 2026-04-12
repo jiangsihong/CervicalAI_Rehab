@@ -1,0 +1,32 @@
+cervical_backend/
+│
+├── app.py                 # Flask 入口，初始化API路由，连接数据库等
+├── config.py              # 配置文件（数据库连接、JWT秘钥、应用的基本配置等）
+├── requirements.txt       # 依赖清单，列出所有必需的库（Flask、SQLAlchemy、TensorFlow等）
+│
+├── models/                # 数据库模型（SQLAlchemy）和深度学习模型文件
+│   ├── user.py            # 用户表（包含年龄、职业等个人信息）
+│   └── assessment.py      # 评估记录表（存储各方向最大角度、分级结果、时间戳）
+│   └── deep_learning_model.py  # 深度学习模型（用于加载与训练颈椎评估的AI模型）
+│
+├── api/                   # 路由层（接收APP请求）
+│   ├── user.py            # 用户注册/登录/信息修改
+│   └── assessment.py      # 接收移动端评估数据、查询历史记录、获取趋势图表数据
+│
+├── services/              # 业务逻辑层
+│   ├── user_service.py    # JWT鉴权、用户数据逻辑（处理用户的注册、登录、数据修改等）
+│   ├── assessment_service.py  # 数据落库、四级分级校验、生成趋势报告
+│   └── analytics_service.py   # (新增) 面向医生/机构的群体数据统计分析（分析群体健康状况，生成报告）
+│
+├── utils/                 # 通用工具（常用的辅助功能模块）
+│   ├── response.py        # 统一的 JSON 响应格式封装（规范返回的API格式）
+│   └── grade_utils.py     # 颈椎健康四级分级逻辑校验（包含四级分级的算法逻辑）
+│   └── data_preprocessing.py  # 数据预处理（处理原始数据，清洗并格式化为适合训练的格式）
+│
+├── logs/                  # 日志目录（记录API请求、错误日志等）
+│
+└── ml/                    # 机器学习目录（单独的训练脚本和模型）
+    ├── train_model.py     # 训练颈椎评估模型的代码（包含训练过程、数据加载、模型训练等）
+    └── evaluate_model.py  # 模型评估代码（验证模型准确性，生成评估报告）
+    └── model_weights/     # 训练后的模型权重保存目录（保存训练后的模型权重文件）
+        └── model_v1.h5    # 训练后的模型权重文件（可以根据版本号命名）
