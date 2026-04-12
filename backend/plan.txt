@@ -1,8 +1,9 @@
-cervical_backend/
+backend/
 │
 ├── app.py                 # Flask 入口，初始化API路由，连接数据库等
 ├── config.py              # 配置文件（数据库连接、JWT秘钥、应用的基本配置等）
 ├── requirements.txt       # 依赖清单，列出所有必需的库（Flask、SQLAlchemy、TensorFlow等）
+├── USAGE_GUIDE.md
 │
 ├── models/                # 数据库模型（SQLAlchemy）和深度学习模型文件
 │   ├── user.py            # 用户表（包含年龄、职业等个人信息）
@@ -30,3 +31,6 @@ cervical_backend/
     └── evaluate_model.py  # 模型评估代码（验证模型准确性，生成评估报告）
     └── model_weights/     # 训练后的模型权重保存目录（保存训练后的模型权重文件）
         └── model_v1.h5    # 训练后的模型权重文件（可以根据版本号命名）
+
+
+conda activate pytorch
