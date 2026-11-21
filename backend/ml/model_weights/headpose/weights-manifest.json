@@ -1,0 +1,57 @@
+{
+  "filename": "pose-estimator.h5",
+  "bytes": 81841920,
+  "sha256": "9fdfad7e55a6bedf77544151ae8591b36f5fa954865a2622b02e9311ec29af97",
+  "parts": [
+    {
+      "name": "pose-estimator.h5.part01",
+      "bytes": 9000000,
+      "sha256": "9e5384cc1e744c919294570ec9f612e4cd092025a82c8061cac7654d35faf5df"
+    },
+    {
+      "name": "pose-estimator.h5.part02",
+      "bytes": 9000000,
+      "sha256": "1162f892eb37b655f6ea54d6c2849d2ec4f0068e00682a07e1303528c124206f"
+    },
+    {
+      "name": "pose-estimator.h5.part03",
+      "bytes": 9000000,
+      "sha256": "3b7b7f2be2430cf310462531eb009a79d280a68370998ce5de975a3866ff041a"
+    },
+    {
+      "name": "pose-estimator.h5.part04",
+      "bytes": 9000000,
+      "sha256": "a12b60622047198b0fa49671fceb34c558146df0e28bc5a0b3f0dbe4145ae248"
+    },
+    {
+      "name": "pose-estimator.h5.part05",
+      "bytes": 9000000,
+      "sha256": "d272a021e589787cf0b89028c410c535a449c5d87cd39f56c2565d6344a2b129"
+    },
+    {
+      "name": "pose-estimator.h5.part06",
+      "bytes": 9000000,
+      "sha256": "cf77269b35d324d58c32303d16103a114d68e4738094f48e72ba7dad0fe3e9f3"
+    },
+    {
+      "name": "pose-estimator.h5.part07",
+      "bytes": 9000000,
+      "sha256": "6c875311370fc3484ec7eba49f1fe8f48007c54cd1f5e99ebe4a8b81807e3185"
+    },
+    {
+      "name": "pose-estimator.h5.part08",
+      "bytes": 9000000,
+      "sha256": "ae756e9c0992d46e9db8934993c3c4bdc5e36ea4fee6ffb9b0c4ccbf60b74d07"
+    },
+    {
+      "name": "pose-estimator.h5.part09",
+      "bytes": 9000000,
+      "sha256": "088c2fb504ba1926d92459455a4466d281a6e36ed9f2d167ef7becd1895ed622"
+    },
+    {
+      "name": "pose-estimator.h5.part10",
+      "bytes": 841920,
+      "sha256": "fd6ba5a94197a641d6f067da1e75941ed79cb7b38626b98ed7dba8602091c599"
+    }
+  ]
+}

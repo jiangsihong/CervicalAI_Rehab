@@ -1,0 +1,3283 @@
+import { ApiClient, ApiError } from "./api.js";
+import { icon } from "./icons.js";
+
+const appElement = document.querySelector("#app");
+const modalRoot = document.querySelector("#modal-root");
+const toastRegion = document.querySelector("#toast-region");
+const api = new ApiClient();
+const CAMERA_CAPTURE_MAX_WIDTH = 640;
+const CAMERA_OVERLAY_FPS = 20;
+const CAMERA_MISS_GRACE_MS = 250;
+
+const ANGLE_FIELDS = [
+  { key: "flexion_angle", label: "前屈", short: "前屈", max: 90, normal: 45, reference: "45° - 60°" },
+  { key: "extension_angle", label: "后伸", short: "后伸", max: 90, normal: 45, reference: "45° - 75°" },
+  { key: "left_lateral_flexion_angle", label: "左侧屈", short: "左侧屈", max: 60, normal: 35, reference: "35° - 45°" },
+  { key: "right_lateral_flexion_angle", label: "右侧屈", short: "右侧屈", max: 60, normal: 35, reference: "35° - 45°" },
+  { key: "left_rotation_angle", label: "左旋转", short: "左旋转", max: 90, normal: 60, reference: "60° - 80°" },
+  { key: "right_rotation_angle", label: "右旋转", short: "右旋转", max: 90, normal: 60, reference: "60° - 80°" },
+];
+
+const VIEW_META = {
+  dashboard: { title: "工作台", subtitle: "检测与评估，从这里开始" },
+  detection: { title: "姿态检测", subtitle: "图片与实时头颈姿态分析" },
+  assessment: { title: "六方向评估", subtitle: "颈椎活动度记录与分级" },
+  records: { title: "历史记录", subtitle: "摄像头检测与六方向评估" },
+  profile: { title: "个人中心", subtitle: "账号与健康资料" },
+  admin: { title: "用户管理", subtitle: "账号统计与权限查看" },
+  patients: { title: "患者查询", subtitle: "医生端患者评估记录" },
+};
+
+const state = {
+  authMode: "login",
+  authDraft: { login: {}, register: {} },
+  authVerification: { login: {}, register: {} },
+  user: readJson("cervical_user"),
+  guest: localStorage.getItem("cervical_guest") === "true",
+  route: routeFromHash(),
+  sidebarOpen: false,
+  connection: "checking",
+  connectionMessage: "正在检查后端",
+  poseStatus: null,
+  dashboard: {
+    loading: false,
+    summary: null,
+    history: [],
+    error: "",
+  },
+  detection: {
+    tab: "image",
+    fileName: "",
+    imagePreview: "",
+    result: null,
+    loading: false,
+    error: "",
+    confidenceThreshold: 0.15,
+  },
+  camera: {
+    session: null,
+    checkpointTimer: 0,
+    starting: false,
+    active: false,
+    stream: null,
+    timer: 0,
+    inFlight: false,
+    fps: 20,
+    actualFps: 0,
+    completedFrameTimes: [],
+    lastResult: null,
+    overlayFrame: 0,
+    overlayLastDrawAt: 0,
+    overlayCurrent: null,
+    overlayTarget: null,
+    overlayResult: null,
+    overlayLastDetectionAt: 0,
+    angleHistory: { tilt: [], pan: [], roll: [] },
+    filteredAngles: { tilt: null, pan: null, roll: null },
+    lastAngleDetectionAt: 0,
+    lastRollDetectionAt: 0,
+  },
+  assessmentForm: {
+    assessment_date: today(),
+    flexion_angle: "",
+    extension_angle: "",
+    left_lateral_flexion_angle: "",
+    right_lateral_flexion_angle: "",
+    left_rotation_angle: "",
+    right_rotation_angle: "",
+    assessment_duration: "",
+    device_info: navigator.userAgent,
+    app_version: "frontend-1.0",
+  },
+  lastAssessment: null,
+  records: {
+    tab: "camera",
+    loading: false,
+    error: "",
+    history: [],
+    total: 0,
+    limit: 20,
+    offset: 0,
+    startDate: "",
+    endDate: "",
+    trendDays: 30,
+    trend: null,
+    summary: null,
+  },
+  cameraRecords: { loading: false, history: [], total: 0, offset: 0, limit: 20, error: "" },
+  admin: {
+    loading: false,
+    error: "",
+    stats: null,
+    users: [],
+    total: 0,
+    page: 1,
+    perPage: 20,
+    pages: 0,
+    role: "",
+    search: "",
+  },
+  patients: {
+    loading: false,
+    error: "",
+    patientId: "",
+    data: null,
+  },
+};
+
+function readJson(key) {
+  try {
+    return JSON.parse(localStorage.getItem(key) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function saveUser(user) {
+  state.user = user || null;
+  if (state.user) {
+    localStorage.setItem("cervical_user", JSON.stringify(state.user));
+  } else {
+    localStorage.removeItem("cervical_user");
+  }
+}
+
+function today() {
+  const value = new Date();
+  const local = new Date(value.getTime() - value.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+function routeFromHash() {
+  return window.location.hash.replace(/^#\/?/, "") || "dashboard";
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function escapeAttribute(value) {
+  return escapeHtml(value);
+}
+
+function formatNumber(value, fallback = "—") {
+  if (value === null || value === undefined || value === "") return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(1) : fallback;
+}
+
+function formatDate(value, includeTime = false) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return escapeHtml(value);
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    ...(includeTime ? { hour: "2-digit", minute: "2-digit" } : {}),
+  }).format(date);
+}
+
+function roleLabel(role) {
+  return {
+    patient: "患者",
+    doctor: "医生",
+    admin: "管理员",
+    guest: "游客",
+  }[role] || "用户";
+}
+
+function gradeMeta(grade) {
+  return {
+    normal: { label: "正常", tone: "success" },
+    mild: { label: "轻度", tone: "warning" },
+    moderate: { label: "中度", tone: "info" },
+    severe: { label: "重度", tone: "danger" },
+  }[grade] || { label: "未分级", tone: "" };
+}
+
+function initials(user) {
+  const source = user?.full_name || user?.username || "访";
+  return String(source).trim().slice(0, 2).toUpperCase();
+}
+
+function currentUser() {
+  return state.user || {
+    username: "游客体验",
+    full_name: "游客",
+    role: "guest",
+  };
+}
+
+function isAuthenticated() {
+  return Boolean(state.user && api.token);
+}
+
+function canUseProtectedViews() {
+  return isAuthenticated();
+}
+
+function isClinicalRole() {
+  return ["doctor", "admin"].includes(state.user?.role);
+}
+
+function allowedRoute(route) {
+  const publicRoutes = ["dashboard", "detection", "records"];
+  if (!canUseProtectedViews()) return publicRoutes.includes(route);
+  if (route === "admin" || route === "patients") return false;
+  return Object.hasOwn(VIEW_META, route);
+}
+
+function normalizeRoute() {
+  if (!allowedRoute(state.route)) {
+    state.route = "dashboard";
+    history.replaceState(null, "", "#/dashboard");
+  }
+}
+
+function renderApp() {
+  captureAuthDraft();
+  normalizeRoute();
+  if (!state.user && !state.guest) {
+    appElement.innerHTML = renderAuth();
+    updateAuthCodeButton();
+    return;
+  }
+  appElement.innerHTML = renderShell();
+  window.requestAnimationFrame(() => {
+    if (state.camera.active && state.route === "detection" && state.detection.tab === "camera") {
+      const video = document.querySelector("#browser-camera");
+      if (video && video.srcObject !== state.camera.stream) {
+        video.srcObject = state.camera.stream;
+        video.play().catch(() => stopCamera());
+        document.querySelector("#camera-empty")?.setAttribute("hidden", "");
+        updateCameraControls();
+        updateCameraFpsLabel();
+      }
+    }
+    if (state.route === "records" && state.records.trend) {
+      drawTrendChart();
+    }
+  });
+}
+
+function renderAuth() {
+  const isLogin = state.authMode === "login";
+  const draft = state.authDraft[state.authMode];
+  const verification = state.authVerification[state.authMode];
+  return `
+    <main class="auth-shell">
+      <section class="auth-visual" aria-label="CervicalAI">
+        <div class="auth-brand">
+          <div class="brand-mark" aria-hidden="true"><span></span></div>
+          <div>
+            <strong>CervicalAI Rehab</strong>
+            <small>面向患者的颈椎自测</small>
+          </div>
+        </div>
+        <div class="pose-visual" aria-hidden="true">
+          <div class="pose-visual__axis"></div>
+          <div class="pose-visual__head"></div>
+          <div class="pose-visual__arrow"></div>
+        </div>
+        <div class="auth-copy">
+          <h1>让每一次颈椎评估都有清晰记录</h1>
+          <p>使用图片或摄像头了解头颈姿态，记录活动度变化，回看自己的自测记录。</p>
+        </div>
+      </section>
+      <section class="auth-panel">
+        <div class="auth-form-wrap">
+          <div class="auth-heading">
+            <h2>${isLogin ? "欢迎回来" : "创建账号"}</h2>
+            <p>${isLogin ? "使用密码和邮箱验证码登录，保护你的自测记录。" : "验证邮箱后创建患者账号，个人资料可在登录后完善。"}</p>
+          </div>
+          <div class="auth-tabs" role="tablist" aria-label="账号操作">
+            <button class="auth-tab ${isLogin ? "is-active" : ""}" type="button" data-action="auth-mode" data-mode="login">登录</button>
+            <button class="auth-tab ${!isLogin ? "is-active" : ""}" type="button" data-action="auth-mode" data-mode="register">注册</button>
+          </div>
+          <form class="auth-form" id="auth-form" data-mode="${state.authMode}" aria-busy="${Boolean(verification.sending)}">
+            <div class="field">
+              <label for="auth-username">${isLogin ? "用户名或邮箱" : "用户名"}</label>
+              <input class="input" id="auth-username" name="username" autocomplete="username" required minlength="${isLogin ? 1 : 2}" maxlength="${isLogin ? 100 : 50}" ${isLogin ? "" : 'pattern="[A-Za-z0-9_\\u4e00-\\u9fff.\\-]+"'} value="${escapeAttribute(draft.username || "")}" placeholder="${isLogin ? "请输入用户名或注册邮箱" : "2–50 位，支持中文、字母、数字、下划线、点和短横线"}">
+            </div>
+            ${isLogin ? "" : `
+              <div class="field">
+                <label for="auth-email">邮箱</label>
+                <input class="input" id="auth-email" name="email" type="email" autocomplete="email" required maxlength="100" value="${escapeAttribute(draft.email || "")}" placeholder="支持 QQ、163、Gmail 等常见邮箱">
+              </div>
+            `}
+            <div class="field">
+              <label for="auth-password">密码</label>
+              <input class="input" id="auth-password" name="password" type="password" autocomplete="${isLogin ? "current-password" : "new-password"}" required minlength="${isLogin ? 1 : 8}" maxlength="128" ${isLogin ? "" : 'pattern="(?=.*[a-zA-Z])(?=.*[0-9]).{8,128}"'} value="${escapeAttribute(draft.password || "")}" placeholder="${isLogin ? "请输入账号密码" : "8–128 位，包含英文字母和数字"}">
+            </div>
+            ${isLogin ? "" : `<div class="field">
+              <label for="auth-confirm-password">确认密码</label>
+              <input class="input" id="auth-confirm-password" name="confirm_password" type="password" autocomplete="new-password" required minlength="8" maxlength="128" value="${escapeAttribute(draft.confirm_password || "")}" placeholder="再次输入密码">
+            </div>`}
+            <div class="field">
+              <label for="auth-code">邮箱验证码</label>
+              <div class="verification-row">
+                <input class="input" id="auth-code" name="verification_code" inputmode="numeric" autocomplete="one-time-code" required pattern="[0-9]{6}" maxlength="6" value="${escapeAttribute(draft.verification_code || "")}" placeholder="6 位数字">
+                <button class="button button--secondary" type="button" data-action="send-email-code">获取验证码</button>
+              </div>
+              <small id="auth-code-status" class="field-help" aria-live="polite">${escapeHtml(verification.message || (isLogin ? "验证密码后，验证码将发送至账号绑定的邮箱。" : "验证码 5 分钟有效，请勿向他人透露。"))}</small>
+            </div>
+            <p id="auth-error" class="auth-error" role="alert" ${verification.error ? "" : "hidden"}>${escapeHtml(verification.error || "")}</p>
+            <button class="button button--primary button--block" type="submit">
+              ${icon(isLogin ? "LogIn" : "UserPlus", 18)}
+              ${isLogin ? "登录" : "注册并登录"}
+            </button>
+          </form>
+          <div class="auth-secondary">
+            <button class="button button--secondary button--block" type="button" data-action="guest">
+              ${icon("ScanFace", 18)}
+              游客体验姿态检测
+            </button>
+            <button class="button button--ghost button--block button--small" type="button" data-action="settings">
+              ${icon("Settings", 16)}
+              后端连接设置
+            </button>
+          </div>
+          <div class="connection-note">
+            ${state.connection === "online" ? icon("Wifi", 14) : icon("WifiOff", 14)}
+            <span>${escapeHtml(state.connectionMessage)}</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  `;
+}
+
+function renderShell() {
+  const user = currentUser();
+  const meta = VIEW_META[state.route] || VIEW_META.dashboard;
+  return `
+    <div class="app-shell">
+      ${state.sidebarOpen ? `<button class="sidebar-backdrop" type="button" data-action="close-sidebar" aria-label="关闭导航"></button>` : ""}
+      <aside class="sidebar ${state.sidebarOpen ? "is-open" : ""}">
+        <div class="sidebar-head">
+          <div class="brand-mark" aria-hidden="true"><span></span></div>
+          <div>
+            <strong>CervicalAI</strong>
+            <small>康复评估系统</small>
+          </div>
+        </div>
+        <nav class="sidebar-nav" aria-label="主导航">
+          <span class="nav-label">评估</span>
+          ${navItem("dashboard", "LayoutDashboard", "工作台")}
+          ${navItem("detection", "ScanFace", "姿态检测")}
+          ${canUseProtectedViews() ? navItem("assessment", "ClipboardList", "六方向评估") : ""}
+          ${navItem("records", "History", "历史记录")}
+          ${canUseProtectedViews() ? `<span class="nav-label">账号</span>` : ""}
+          ${canUseProtectedViews() ? navItem("profile", "UserRound", "个人中心") : ""}
+        </nav>
+        <div class="sidebar-foot">
+          <div class="sidebar-user">
+            <div class="avatar">${escapeHtml(initials(user))}</div>
+            <div class="sidebar-user__text">
+              <strong>${escapeHtml(user.full_name || user.username)}</strong>
+              <small>${roleLabel(user.role)}</small>
+            </div>
+            <button class="icon-button icon-button--dark" type="button" data-action="${state.guest ? "exit-guest" : "logout"}" title="${state.guest ? "退出游客模式" : "退出登录"}">
+              ${icon("LogOut", 16)}
+            </button>
+          </div>
+        </div>
+      </aside>
+      <div class="main-shell">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button class="icon-button mobile-menu" type="button" data-action="open-sidebar" title="打开导航">
+              ${icon("Menu", 19)}
+            </button>
+            <div class="topbar-title">
+              <strong>${meta.title}</strong>
+              <small>${meta.subtitle}</small>
+            </div>
+          </div>
+          <div class="topbar-right">
+            <button id="connection-chip" class="connection-chip ${state.connection === "online" ? "is-online" : state.connection === "offline" ? "is-offline" : ""}" type="button" data-action="refresh-connection" title="重新检查后端">
+              ${state.connection === "online" ? icon("Wifi", 15) : icon("WifiOff", 15)}
+              <span>${escapeHtml(state.connection === "online" ? "后端已连接" : state.connection === "checking" ? "连接检查中" : "后端未连接")}</span>
+            </button>
+            <button class="icon-button" type="button" data-action="settings" title="连接设置">
+              ${icon("Settings", 18)}
+            </button>
+          </div>
+        </header>
+        <main class="page-content">
+          ${isAuthenticated() && needsProfile(state.user) && state.route !== "profile" ? `<div class="onboarding-note" role="status"><div><strong>建议先完善个人资料</strong><p>填写姓名或称呼、年龄和性别，方便整理自己的自测记录。其他资料可选。</p></div><button class="button button--secondary" type="button" data-route="profile">去完善资料</button></div>` : ""}
+          ${renderView()}
+        </main>
+      </div>
+    </div>
+  `;
+}
+
+function navItem(route, iconName, label, count = "") {
+  return `
+    <button class="nav-item ${state.route === route ? "is-active" : ""}" type="button" data-route="${route}">
+      ${icon(iconName, 18)}
+      <span>${label}</span>
+      ${count !== "" ? `<span class="nav-count">${escapeHtml(count)}</span>` : ""}
+    </button>
+  `;
+}
+
+function renderView() {
+  switch (state.route) {
+    case "detection":
+      return renderDetection();
+    case "assessment":
+      return renderAssessment();
+    case "records":
+      return renderRecords();
+    case "profile":
+      return renderProfile();
+    case "admin":
+      return renderAdmin();
+    case "patients":
+      return renderPatients();
+    default:
+      return renderDashboard();
+  }
+}
+
+function viewHeader(title, description, actions = "") {
+  return `
+    <div class="view-header">
+      <div>
+        <h1>${title}</h1>
+        <p>${description}</p>
+      </div>
+      ${actions ? `<div class="view-actions">${actions}</div>` : ""}
+    </div>
+  `;
+}
+
+function renderDashboard() {
+  const user = currentUser();
+  return `
+    <div class="dashboard">
+      <div class="dashboard-heading">
+        <div>
+          <h1>${state.guest ? "从一次姿态检测开始" : `你好，${escapeHtml(user.full_name || user.username)}`}</h1>
+          <p>${state.guest ? "选择适合你的方式，了解当前头颈姿态。" : "开始今天的检测，或回顾你的评估记录。"}</p>
+        </div>
+        <span class="dashboard-date">${icon("CalendarDays", 16)}${formatDate(new Date())}</span>
+      </div>
+      <section class="dashboard-launch" aria-label="开始检测与评估">
+        <article class="camera-feature">
+          <div class="camera-feature__copy">
+            <span class="feature-eyebrow">${icon("Camera", 16)}实时姿态检测</span>
+            <h2>看见姿态，<br>了解每一次转动。</h2>
+            <p>打开摄像头，实时查看头颈角度与姿态变化。</p>
+            <button class="button feature-button" type="button" data-route="detection" data-detection-tab="camera">开启实时检测${icon("ArrowUpRight", 18)}</button>
+            <span class="camera-feature__note">${icon("Info", 14)}点击后进入检测页，再开启摄像头</span>
+          </div>
+          <div class="camera-feature__visual" aria-hidden="true">
+            <svg viewBox="0 0 260 280" fill="none">
+              <circle cx="130" cy="130" r="100" stroke="currentColor" opacity=".15"/>
+              <circle cx="130" cy="130" r="78" stroke="currentColor" stroke-dasharray="3 8" opacity=".25"/>
+              <path d="M130 19v24M130 219v24M19 130h24M219 130h24" stroke="currentColor" opacity=".3"/>
+              <path d="M77 70H60v20M183 70h17v20M60 178v20h17M200 178v20h-17" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+              <path d="M109 183v21c0 12-18 15-29 22l-15 13M152 182v22c0 12 18 15 29 22l15 13" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" opacity=".6"/>
+              <path d="M91 114c0-29 16-48 39-48s39 19 39 48v25c0 31-20 53-39 53s-39-22-39-53v-25Z" fill="currentColor" fill-opacity=".06" stroke="currentColor" stroke-width="2.5"/>
+              <path d="M107 123h9M145 123h9M128 126l-4 20h10M117 160c8 6 18 6 26 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity=".75"/>
+              <path d="M64 140h132" stroke="#9bdfc4" stroke-width="1.5" opacity=".7"/>
+              <circle cx="91" cy="140" r="4" fill="#9bdfc4"/><circle cx="169" cy="140" r="4" fill="#9bdfc4"/>
+            </svg>
+          </div>
+        </article>
+        <div class="dashboard-options">
+          ${quickAction("detection", "Image", "图片检测", "上传一张照片，查看角度与标注结果", { detectionTab: "image" })}
+          ${quickAction("assessment", "ClipboardList", "六方向评估", "记录各方向活动度，保存本次评估", canUseProtectedViews() ? {} : { action: "show-login" })}
+        </div>
+      </section>
+      <section class="dashboard-bottom" aria-label="评估记录与检测准备">
+        ${state.guest ? `
+          <article class="dashboard-account">
+            <span class="dashboard-account__icon">${icon("History", 24)}</span>
+            <div><h2>让每次评估都有迹可循</h2><p>登录后保存评估记录，查看不同日期的活动度变化。</p></div>
+            <button class="button button--secondary" type="button" data-action="show-login">登录账号${icon("ChevronRight", 16)}</button>
+          </article>` : `
+          <article class="panel dashboard-history">
+            <div class="panel__header">
+              <div><h2>最近评估</h2><p>回顾每一次活动度记录</p></div>
+              <button class="button button--ghost button--small" type="button" data-route="records" data-record-tab="assessment">全部记录${icon("ChevronRight", 15)}</button>
+            </div>
+            <div class="panel__body">${renderRecentActivity()}</div>
+          </article>`}
+        <aside class="dashboard-preparation">
+          <h2>${icon("ScanFace", 18)}检测前，准备一下</h2>
+          <ul>
+            <li>保持光线充足，让面部清晰入镜</li>
+            <li>将摄像头放稳，尽量与视线齐平</li>
+            <li>画面中保留一人，避免遮挡双眼</li>
+          </ul>
+        </aside>
+      </section>
+      <p class="dashboard-footnote">${icon("Info", 14)}姿态检测展示当前角度；六方向评估记录各方向的最大活动角度。</p>
+    </div>
+  `;
+}
+
+function quickAction(route, iconName, title, description, options = {}) {
+  const attribute = options.action
+    ? `data-action="${options.action}"`
+    : `data-route="${route}"${options.detectionTab ? ` data-detection-tab="${options.detectionTab}"` : ""}`;
+  return `
+    <button class="quick-action" type="button" ${attribute}>
+      <span class="quick-action__icon">${icon(iconName, 23)}</span>
+      <span class="quick-action__copy">
+        <strong>${title}</strong>
+        <small>${description}</small>
+        <span class="quick-action__link">${options.action ? "登录后开始" : "开始使用"}${icon("ArrowUpRight", 14)}</span>
+      </span>
+    </button>
+  `;
+}
+
+function renderRecentActivity() {
+  if (state.guest) {
+    return emptyState(
+      "History",
+      "登录后显示评估记录",
+      "登录账号后可保存评估并查看恢复变化。",
+      { action: "show-login", label: "登录账号", icon: "LogIn" }
+    );
+  }
+  if (state.dashboard.loading) {
+    return `<div class="activity-list">${Array.from({ length: 3 }, () => `<div class="activity-item"><span class="activity-item__icon skeleton"></span><span><strong class="skeleton">正在读取记录</strong></span></div>`).join("")}</div>`;
+  }
+  if (state.dashboard.error) {
+    return errorState("评估数据暂不可用", state.dashboard.error, "refresh-dashboard");
+  }
+  if (!state.dashboard.history.length) {
+    return emptyState(
+      "ClipboardList",
+      "还没有评估记录",
+      "完成第一次六方向活动度评估后，结果会按日期显示在这里。",
+      { route: "assessment", label: "开始首次评估", icon: "ClipboardList" }
+    );
+  }
+  return `
+    <div class="activity-list">
+      ${state.dashboard.history.map((item) => {
+        const grade = gradeMeta(item.grade);
+        return `
+          <button class="activity-item" type="button" data-assessment-id="${escapeAttribute(item.id)}">
+            <span class="activity-item__icon">${icon("ClipboardList", 16)}</span>
+            <span>
+              <strong>${formatDate(item.assessment_date)} · ${grade.label}</strong>
+              <small>前屈 ${formatNumber(item.flexion_angle)}°，左旋转 ${formatNumber(item.left_rotation_angle)}°</small>
+            </span>
+            <time>${formatDate(item.created_at, true)}</time>
+          </button>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function emptyState(iconName, title, description, action = null) {
+  let actionButton = "";
+  if (typeof action === "string" && action) {
+    actionButton = `<button class="button button--secondary button--small" type="button" data-action="${escapeAttribute(action)}">${icon("RefreshCw", 15)}重试</button>`;
+  } else if (action?.route) {
+    actionButton = `<button class="button button--primary button--small" type="button" data-route="${escapeAttribute(action.route)}">${icon(action.icon || "ArrowRight", 15)}${escapeHtml(action.label || "继续")}</button>`;
+  } else if (action?.action) {
+    actionButton = `<button class="button button--primary button--small" type="button" data-action="${escapeAttribute(action.action)}">${icon(action.icon || "ArrowRight", 15)}${escapeHtml(action.label || "继续")}</button>`;
+  }
+  return `
+    <div class="empty-state">
+      <div class="empty-state__icon">${icon(iconName, 22)}</div>
+      <h3>${escapeHtml(title)}</h3>
+      <p>${escapeHtml(description)}</p>
+      ${actionButton}
+    </div>
+  `;
+}
+
+function errorState(title, description, action = "") {
+  return `
+    <div class="error-state">
+      <div class="error-state__icon">${icon("AlertTriangle", 22)}</div>
+      <h3>${escapeHtml(title)}</h3>
+      <p>${escapeHtml(description)}</p>
+      ${action ? `<button class="button button--secondary button--small" type="button" data-action="${action}">${icon("RefreshCw", 15)}重试</button>` : ""}
+    </div>
+  `;
+}
+
+function renderDetection() {
+  return `
+    ${viewHeader(
+      "姿态检测",
+      "图片与实时模式输出 Tilt、Pan 与 Roll 三轴角度。当前结果是姿态提示，不替代完整六方向评估。",
+      `<span class="status-badge ${state.poseStatus?.ready_for_inference ? "status-badge--success" : "status-badge--danger"}">${state.poseStatus?.ready_for_inference ? "模型可用" : "模型未就绪"}</span>`
+    )}
+    <div class="section-heading">
+      <div class="tabs" role="tablist" aria-label="检测模式">
+        ${detectTab("image", "Image", "图片检测")}
+        ${detectTab("camera", "Camera", "浏览器摄像头")}
+      </div>
+    </div>
+    ${state.detection.tab === "camera"
+      ? renderBrowserCamera()
+      : renderImageDetection()}
+  `;
+}
+
+function detectTab(tab, iconName, label) {
+  return `
+    <button class="tab-button ${state.detection.tab === tab ? "is-active" : ""}" type="button" data-detect-tab="${tab}">
+      ${icon(iconName, 15)}${label}
+    </button>
+  `;
+}
+
+function renderImageDetection() {
+  const resultImage = state.detection.result?.annotated_image;
+  const stageImage = resultImage || state.detection.imagePreview;
+  return `
+    <div class="detection-layout">
+      <section class="panel">
+        <div class="media-stage" id="image-stage">
+          ${stageImage
+            ? `
+              <img src="${escapeAttribute(stageImage)}" alt="${resultImage ? "姿态检测标注结果" : "待检测图片"}">
+              <div class="media-stage__toolbar">
+                <button class="icon-button icon-button--dark" type="button" data-action="reset-image" title="重新选择图片">${icon("RefreshCw", 17)}</button>
+              </div>
+            `
+            : `
+              <label class="dropzone" for="pose-image-input" tabindex="0">
+                <span class="dropzone__icon">${icon("Upload", 25)}</span>
+                <strong>选择一张清晰的人像图片</strong>
+                <p>支持 JPG、PNG，单张不超过 16 MB</p>
+                <span class="button button--soft">${icon("Image", 16)}选择图片</span>
+              </label>
+            `}
+          ${state.detection.loading ? `<div class="media-loading">${icon("RefreshCw", 28, "spinner")}<strong>模型分析中</strong></div>` : ""}
+          <input class="sr-only" id="pose-image-input" type="file" accept="image/png,image/jpeg,image/jpg">
+        </div>
+        <div class="camera-controlbar">
+          <span class="field-label">${state.detection.fileName ? escapeHtml(state.detection.fileName) : "图片检测"}</span>
+          <label class="range-control">
+            <span>置信度</span>
+            <input class="range" type="range" min="0" max="1" step="0.05" value="${state.detection.confidenceThreshold}" data-confidence-threshold>
+            <strong>${Number(state.detection.confidenceThreshold).toFixed(2)}</strong>
+          </label>
+          ${stageImage ? `<button class="button button--secondary button--small" type="button" data-action="choose-image">${icon("Upload", 15)}更换</button>` : `<span></span>`}
+        </div>
+      </section>
+      <aside id="pose-result-panel" class="result-stack">
+        ${renderPoseResult(state.detection.result, state.detection.error)}
+      </aside>
+    </div>
+  `;
+}
+
+function renderBrowserCamera() {
+  return `
+    <div class="detection-layout">
+      <section class="panel">
+        <div class="media-stage">
+          <div class="camera-wrap" id="browser-camera-wrap">
+            <video id="browser-camera" playsinline muted></video>
+            <canvas id="camera-overlay" class="camera-overlay" aria-hidden="true"></canvas>
+            <div class="camera-empty" id="camera-empty">
+              <span class="camera-empty__icon">${icon("Camera", 30)}</span>
+              <strong>摄像头尚未启动</strong>
+              <p>浏览器会在本机采集画面，并将压缩帧发送到姿态接口。</p>
+            </div>
+          </div>
+        </div>
+        <div class="camera-controlbar">
+          <button id="camera-toggle" class="button button--primary" type="button" data-action="toggle-camera">
+            ${icon("Play", 16)}启动检测
+          </button>
+          <label class="range-control">
+            <span>目标频率</span>
+            <input class="range" type="range" min="5" max="20" step="5" value="${state.camera.fps}" data-camera-fps>
+            <strong id="camera-fps-label" title="实时显示已完成的推理帧率">${cameraFpsLabel()}</strong>
+          </label>
+          <button class="button button--secondary button--small" type="button" data-action="camera-snapshot" ${state.camera.active ? "" : "disabled"}>
+            ${icon("Camera", 15)}立即检测
+          </button>
+        </div>
+        <div class="camera-history-hint">
+          <span id="camera-record-status">${state.camera.active ? "检测记录保存中" : "每次检测自动生成一条记录"} · ${isAuthenticated() ? "保存到当前账号" : "游客记录保存在当前浏览器"}</span>
+          <button class="button button--ghost button--small" type="button" data-action="camera-history">${icon("History", 15)}查看历史</button>
+        </div>
+      </section>
+      <aside id="pose-result-panel" class="result-stack">
+        ${renderPoseResult(state.camera.lastResult)}
+      </aside>
+    </div>
+  `;
+}
+
+function cameraFpsLabel() {
+  const fps = state.camera.active && state.camera.actualFps > 0
+    ? state.camera.actualFps
+    : state.camera.fps;
+  return `${fps.toFixed(1)} FPS`;
+}
+
+function updateCameraFpsLabel() {
+  const label = document.querySelector("#camera-fps-label");
+  if (!label) return;
+  label.textContent = cameraFpsLabel();
+  label.title = state.camera.active
+    ? `目标 ${state.camera.fps.toFixed(0)} FPS，当前为已完成推理帧率`
+    : `目标 ${state.camera.fps.toFixed(0)} FPS`;
+}
+
+function renderPoseResult(result, error = "") {
+  if (error) {
+    return `<div class="panel">${errorState("检测失败", error)}</div>`;
+  }
+  if (!result) {
+    return `
+      <div class="panel">
+        ${emptyState("ScanFace", "等待检测结果", "检测到头部后将在这里显示角度与姿态状态。")}
+      </div>
+      <div class="notice notice--info">${icon("Info", 17)}<span>Roll 由双眼连线估计；双眼被遮挡或侧脸时显示为“—”。</span></div>
+    `;
+  }
+
+  const summary = result.summary || {};
+  if (!summary.detected) {
+    return `
+      <div class="panel">${emptyState("ScanFace", "未检测到头部", summary.message || "请使用光线充足、头部清晰的画面。")}</div>
+      <div class="notice notice--info">${icon("Info", 17)}<span>可降低置信度阈值后重试，但过低会增加误检。</span></div>
+    `;
+  }
+
+  const grade = gradeMeta(summary.health_grade || summary.health_status?.grade);
+  const detections = Array.isArray(result.detections) ? result.detections : [];
+  const rollValue = summary.roll_degrees === null || summary.roll_degrees === undefined
+    ? null
+    : Number(summary.roll_degrees);
+  const hasRoll = Number.isFinite(rollValue);
+  const rollDirection = !hasRoll
+    ? "双眼未稳定识别"
+    : Math.abs(rollValue) < 0.5
+      ? "接近水平"
+      : rollValue > 0 ? "左侧屈方向" : "右侧屈方向";
+  return `
+    <article class="panel pose-summary pose-summary--${escapeAttribute(summary.health_grade || "normal")}">
+      <div class="pose-summary__head">
+        <div>
+          <h3>${grade.label}姿态</h3>
+          <p>${escapeHtml(summary.health_message || "当前姿态分析完成")}</p>
+        </div>
+        <span class="status-badge status-badge--${grade.tone}">${grade.label}</span>
+      </div>
+      <div class="angle-pair">
+        <div class="angle-value">
+          <span>Tilt 俯仰</span>
+          <strong data-pose-tilt>${formatNumber(summary.tilt_degrees)}°</strong>
+          <small>${Number(summary.tilt_degrees) >= 0 ? "前屈方向" : "后伸方向"}</small>
+        </div>
+        <div class="angle-value">
+          <span>Pan 旋转</span>
+          <strong data-pose-pan>${formatNumber(summary.pan_degrees)}°</strong>
+          <small>${Number(summary.pan_degrees) >= 0 ? "左旋方向" : "右旋方向"}</small>
+        </div>
+        <div class="angle-value">
+          <span>Roll 侧倾</span>
+          <strong data-pose-roll>${hasRoll ? `${formatNumber(rollValue)}°` : "—"}</strong>
+          <small>${rollDirection}</small>
+        </div>
+      </div>
+    </article>
+    <article class="panel">
+      <div class="panel__header">
+        <h3>检测目标</h3>
+        <span class="status-badge status-badge--info">${Number(result.detection_count || detections.length)} 个</span>
+      </div>
+      <div class="panel__body">
+        <div class="detection-list">
+          ${detections.slice(0, 6).map((item, index) => `
+            <div class="detection-row">
+              <span class="detection-index">${index + 1}</span>
+              <span>俯仰 ${formatNumber(item.cervical_angles?.raw_tilt)}° · 旋转 ${formatNumber(item.cervical_angles?.raw_pan)}° · 侧倾 ${item.cervical_angles?.raw_roll == null ? "—" : `${formatNumber(item.cervical_angles.raw_roll)}°`}</span>
+              <strong>${item.confidence == null ? "侧脸" : `${Math.round(item.confidence * 100)}%`}</strong>
+            </div>
+          `).join("") || `<span class="field-hint">未返回目标详情</span>`}
+        </div>
+      </div>
+    </article>
+    <div class="notice notice--info">${icon("Info", 17)}<span>${escapeHtml(summary.recommendation || "结果仅用于姿态提示。")}</span></div>
+  `;
+}
+
+function renderAssessment() {
+  return `
+    ${viewHeader(
+      "六方向活动度评估",
+      "完整填写六个方向，提交后由后端统一计算分级并保存。",
+      `<button class="button button--secondary" type="button" data-action="import-pose" ${latestPoseAngles() ? "" : "disabled"}>${icon("ArrowUpRight", 16)}带入最近检测</button>`
+    )}
+    <div class="notice notice--warning">
+      ${icon("AlertTriangle", 18)}
+      <span>单帧姿态不能直接代表活动度范围。请填写每个方向测得的最大活动角度。</span>
+    </div>
+    <div class="assessment-layout section">
+      <section class="panel">
+        <div class="panel__header">
+          <div>
+            <h2>评估数据</h2>
+            <p>六个角度均为必填项</p>
+          </div>
+          <span class="status-badge status-badge--info">${completedAngleCount()} / 6</span>
+        </div>
+        <div class="panel__body">
+          <form class="assessment-form" id="assessment-form">
+            <div class="form-grid">
+              <div class="field">
+                <label for="assessment-date">评估日期</label>
+                <input class="input" id="assessment-date" name="assessment_date" type="date" required value="${escapeAttribute(state.assessmentForm.assessment_date)}">
+              </div>
+              <div class="field">
+                <label for="assessment-duration">评估时长</label>
+                <input class="input" id="assessment-duration" name="assessment_duration" type="number" min="0" step="1" placeholder="秒" value="${escapeAttribute(state.assessmentForm.assessment_duration)}">
+              </div>
+            </div>
+            <div class="angle-control-grid">
+              ${ANGLE_FIELDS.map(renderAngleControl).join("")}
+            </div>
+            <div class="field">
+              <label for="device-info">设备信息</label>
+              <input class="input" id="device-info" name="device_info" maxlength="200" value="${escapeAttribute(state.assessmentForm.device_info)}">
+            </div>
+            <div class="form-actions">
+              <button class="button button--secondary" type="button" data-action="reset-assessment">${icon("RefreshCw", 16)}清空角度</button>
+              <button class="button button--primary" type="submit">${icon("Save", 16)}提交评估</button>
+            </div>
+          </form>
+        </div>
+      </section>
+      <aside class="result-stack">
+        <article class="panel">
+          <div class="panel__header">
+            <div>
+              <h3>活动度参考</h3>
+              <p>正常成年人最低参考值</p>
+            </div>
+          </div>
+          <div class="panel__body">
+            <div class="reference-list">
+              ${ANGLE_FIELDS.map(renderReferenceRow).join("")}
+            </div>
+          </div>
+        </article>
+        ${state.lastAssessment ? renderSubmittedAssessment(state.lastAssessment) : ""}
+      </aside>
+    </div>
+  `;
+}
+
+function renderAngleControl(field) {
+  const value = state.assessmentForm[field.key];
+  return `
+    <div class="angle-control">
+      <div class="angle-control__main">
+        <div class="angle-control__head">
+          <strong>${field.label}</strong>
+          <small>参考 ${field.reference}</small>
+        </div>
+        <input class="range" type="range" min="0" max="${field.max}" step="0.5" value="${value === "" ? 0 : escapeAttribute(value)}" data-angle-range="${field.key}" aria-label="${field.label}角度">
+      </div>
+      <input class="input" type="number" min="0" max="${field.max}" step="0.1" required placeholder="°" value="${escapeAttribute(value)}" data-assessment-field="${field.key}" aria-label="${field.label}角度数值">
+    </div>
+  `;
+}
+
+function renderReferenceRow(field) {
+  const value = Number(state.assessmentForm[field.key]) || 0;
+  const ratio = Math.min(100, (value / field.normal) * 100);
+  return `
+    <div class="reference-row">
+      <div>
+        <strong>${field.short}</strong>
+        <small>${field.reference}</small>
+        <div class="reference-row__bar"><span style="width:${ratio}%"></span></div>
+      </div>
+      <span>${value ? `${value.toFixed(1)}°` : "—"}</span>
+    </div>
+  `;
+}
+
+function completedAngleCount() {
+  return ANGLE_FIELDS.filter((field) => state.assessmentForm[field.key] !== "").length;
+}
+
+function latestPoseAngles() {
+  return state.camera.lastResult?.summary?.assessment_angles
+    || state.detection.result?.summary?.assessment_angles
+    || null;
+}
+
+function renderSubmittedAssessment(assessment) {
+  const grade = gradeMeta(assessment.grade);
+  return `
+    <article class="panel pose-summary pose-summary--${escapeAttribute(assessment.grade || "normal")}">
+      <div class="pose-summary__head">
+        <div>
+          <h3>提交成功</h3>
+          <p>${escapeHtml(assessment.grade_details || "后端已保存本次评估")}</p>
+        </div>
+        <span class="status-badge status-badge--${grade.tone}">${grade.label}</span>
+      </div>
+      <div class="form-actions">
+        <button class="button button--ghost button--small" type="button" data-route="records" data-record-tab="assessment">查看记录${icon("ChevronRight", 15)}</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderRecords() {
+  const cameraTab = state.records.tab === "camera" || !isAuthenticated();
+  const source = cameraTab ? state.cameraRecords : state.records;
+  return `
+    ${viewHeader(
+      "历史记录",
+      "回看每次摄像头检测，或查看六方向活动度评估。",
+      `<button class="button button--secondary" type="button" data-action="refresh-records">${icon("RefreshCw", 16)}刷新</button>`
+    )}
+    <div class="tabs section" role="tablist" aria-label="记录类型">
+      <button class="tab-button ${cameraTab ? "is-active" : ""}" role="tab" aria-selected="${cameraTab}" type="button" data-record-tab="camera">${icon("Camera", 17)}摄像头检测</button>
+      ${isAuthenticated() ? `<button class="tab-button ${!cameraTab ? "is-active" : ""}" role="tab" aria-selected="${!cameraTab}" type="button" data-record-tab="assessment">${icon("ClipboardList", 17)}六方向评估</button>` : ""}
+    </div>
+    <form class="records-toolbar" id="records-filter-form">
+      <div class="field">
+        <label for="records-start-date">开始日期</label>
+        <input class="input" id="records-start-date" name="start_date" type="date" value="${escapeAttribute(state.records.startDate)}">
+      </div>
+      <div class="field">
+        <label for="records-end-date">结束日期</label>
+        <input class="input" id="records-end-date" name="end_date" type="date" value="${escapeAttribute(state.records.endDate)}">
+      </div>
+      <button class="button button--secondary" type="submit">${icon("Filter", 16)}筛选</button>
+    </form>
+    ${source.loading
+      ? `<section class="section panel">${emptyState("RefreshCw", "正在读取历史记录", "请稍候。")}</section>`
+      : cameraTab ? renderCameraHistory()
+        : state.records.error
+          ? `<section class="section panel">${errorState("评估数据不可用", state.records.error, "refresh-records")}</section>`
+          : renderRecordsContent()}
+  `;
+}
+
+function cameraSessionStatus(session) {
+  return { recording: "检测中", completed: "已结束", interrupted: "检测中断" }[session.status] || "已结束";
+}
+
+function sessionDuration(value) {
+  const seconds = Math.max(0, Math.round(Number(value) || 0));
+  return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+}
+
+function renderCameraHistory() {
+  const records = state.cameraRecords;
+  return `
+    <p class="field-hint">${isAuthenticated() ? "记录保存到当前账号；未同步的记录会在刷新列表时重试。" : "游客记录仅保存在当前浏览器，最多保留最近 100 次。"} 保存角度数据，不录制视频。</p>
+    ${records.error ? `<div class="notice notice--warning section">${icon("Info", 17)}${escapeHtml(records.error)}，以下显示本机已有记录。</div>` : ""}
+    <section class="section panel">
+      <div class="panel__header"><div><h2>摄像头检测记录</h2><p>共 ${records.total} 次 · 每次启动到停止为一条记录</p></div></div>
+      ${!records.history.length ? emptyState("Camera", "暂无摄像头检测记录", "开启一次摄像头检测，结束后即可在这里查看。") : `
+        <div class="table-wrap"><table class="data-table camera-history-table">
+          <thead><tr><th>检测时间</th><th>持续时长</th><th>有效帧 / 检测帧</th><th>平均俯仰</th><th>平均旋转</th><th>平均侧倾</th><th>状态</th><th></th></tr></thead>
+          <tbody>${records.history.map((item) => `<tr>
+            <td>${formatDate(item.started_at, true)}</td><td>${sessionDuration(item.duration_seconds)}</td>
+            <td>${item.detected_frames} / ${item.frame_count}</td>
+            ${["tilt", "pan", "roll"].map((axis) => `<td>${item.angle_stats?.[axis] ? `${formatNumber(item.angle_stats[axis].mean)}°` : "—"}</td>`).join("")}
+            <td><span class="status-badge status-badge--${item.status === "completed" ? "success" : "warning"}">${cameraSessionStatus(item)}</span>${item.pending ? `<small class="record-pending">待同步</small>` : ""}</td>
+            <td><button class="button button--ghost button--small" type="button" data-camera-session-id="${escapeAttribute(item.id)}">查看</button></td>
+          </tr>`).join("")}</tbody>
+        </table></div>
+        <div class="pagination"><span>第 ${Math.floor(records.offset / records.limit) + 1} 页</span><div>
+          <button class="button button--secondary button--small" type="button" data-action="camera-records-prev" ${records.offset === 0 ? "disabled" : ""}>上一页</button>
+          <button class="button button--secondary button--small" type="button" data-action="camera-records-next" ${records.offset + records.limit >= (records.pagingTotal ?? records.total) ? "disabled" : ""}>下一页</button>
+        </div></div>`}
+    </section>`;
+}
+
+function cameraStorageKey() {
+  return `cervical_camera_sessions:${api.baseUrl}:${isAuthenticated() ? state.user.id : "guest"}`;
+}
+
+function localCameraSessions(key = cameraStorageKey()) {
+  const records = readJson(key);
+  return Array.isArray(records) ? records : [];
+}
+
+function storeCameraSession(session, payload, pending) {
+  const records = localCameraSessions(session.storageKey);
+  const existing = records.find((item) => item.id === payload.id);
+  if (existing && existing.revision > payload.revision) return;
+  const entry = { ...payload, pending };
+  const sorted = [entry, ...records.filter((item) => item.id !== payload.id)].sort((a, b) => b.started_at.localeCompare(a.started_at));
+  // Keep every unsynced account record; bound the local cache and guest history.
+  const retained = session.client ? sorted.filter((item, index) => item.pending || index < 100) : sorted.slice(0, 100);
+  try {
+    localStorage.setItem(session.storageKey, JSON.stringify(retained));
+  } catch {
+    if (!session.storageWarning) {
+      showToast("本机记录保存失败", "浏览器存储空间不足，请尽快查看或保存本次结果", "error");
+      session.storageWarning = true;
+    }
+  }
+}
+
+function newSessionClient() {
+  if (!isAuthenticated()) return null;
+  const client = new ApiClient();
+  client.baseUrl = api.baseUrl;
+  client.token = api.token;
+  return client;
+}
+
+function syncCameraSession(session, payload, unloading = false) {
+  if (!session.client) return Promise.resolve();
+  const save = async (snapshot) => {
+    try {
+      await session.client.saveCameraSession(snapshot, { timeout: 8000 });
+      storeCameraSession(session, snapshot, false);
+      if (cameraStorageKey() === session.storageKey && (!state.camera.session || state.camera.session.id === snapshot.id)) {
+        const status = document.querySelector("#camera-record-status");
+        if (status) status.textContent = snapshot.status === "recording" ? "检测中 · 进度已保存到账号" : "本次检测已保存到账号";
+      }
+    } catch {
+      if (cameraStorageKey() === session.storageKey && (!state.camera.session || state.camera.session.id === snapshot.id)) {
+        const status = document.querySelector("#camera-record-status");
+        if (status) status.textContent = "本次记录已暂存本机 · 连接恢复后在历史页同步";
+      }
+    }
+  };
+  if (unloading) {
+    // A local final record is already durable; keepalive is a best-effort extra save.
+    const body = JSON.stringify(payload);
+    if (new TextEncoder().encode(body).length < 60000) {
+      fetch(`${session.client.baseUrl}/api/assessment/pose/sessions/${encodeURIComponent(payload.id)}`, {
+        method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.client.token}` },
+        body, keepalive: true,
+      }).catch(() => {});
+    }
+    return Promise.resolve();
+  }
+  // Coalesce checkpoints during slow/offline requests, keeping the final snapshot.
+  session.pendingPayload = payload;
+  if (session.saveQueue) return session.saveQueue;
+  session.saveQueue = (async () => {
+    while (session.pendingPayload) {
+      const current = session.pendingPayload;
+      session.pendingPayload = null;
+      await save(current);
+    }
+  })().finally(() => { session.saveQueue = null; });
+  return session.saveQueue;
+}
+
+function beginCameraSession() {
+  const session = {
+    id: crypto.randomUUID(), started_at: new Date().toISOString(), clock: performance.now(),
+    status: "recording", revision: 0, frame_count: 0, detected_frames: 0,
+    accumulators: { tilt: null, pan: null, roll: null }, samples: [], sampleInterval: 1,
+    lastSampleAt: -Infinity, storageKey: cameraStorageKey(), client: newSessionClient(),
+  };
+  state.camera.session = session;
+  checkpointCameraSession(session);
+  state.camera.checkpointTimer = window.setInterval(() => checkpointCameraSession(session), 5000);
+  // End the session if the camera is disconnected or its track ends.
+  state.camera.stream?.getVideoTracks().forEach((track) => track.addEventListener("ended", () => {
+    if (state.camera.session === session) {
+      stopCamera(false, true);
+      showToast("摄像头已断开", "本次检测记录已保留", "error");
+    }
+  }, { once: true }));
+}
+
+function collectCameraSessionFrame(session, result) {
+  if (!session) return;
+  session.frame_count += 1;
+  const primary = cameraPrimaryDetection(result);
+  if (primary) session.detected_frames += 1;
+  const point = { elapsed: Number(((performance.now() - session.clock) / 1000).toFixed(3)) };
+  for (const axis of ["tilt", "pan", "roll"]) {
+    const raw = primary?.cervical_angles?.[`raw_${axis}`];
+    // Don't record Roll carried over from a previous frame when eyes are unavailable.
+    const reliable = axis !== "roll" || primary?.cervical_angles?.model_raw_roll != null;
+    const value = reliable && typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+    point[axis] = value;
+    if (value !== null) {
+      const stats = session.accumulators[axis] ||= { count: 0, sum: 0, min: value, max: value };
+      stats.count += 1;
+      stats.sum += value;
+      stats.min = Math.min(stats.min, value);
+      stats.max = Math.max(stats.max, value);
+    }
+  }
+  session.latestPoint = point;
+  if (point.elapsed - session.lastSampleAt >= session.sampleInterval) {
+    if (session.samples.length >= 299) {
+      session.samples = session.samples.filter((_, index) => index % 2 === 0);
+      session.sampleInterval *= 2;
+    }
+    session.samples.push(point);
+    session.lastSampleAt = point.elapsed;
+  }
+}
+
+function checkpointCameraSession(session, unloading = false) {
+  session.revision += 1;
+  const duration = Number(((performance.now() - session.clock) / 1000).toFixed(3));
+  const angleStats = Object.fromEntries(["tilt", "pan", "roll"].map((axis) => {
+    const stats = session.accumulators[axis];
+    return [axis, stats ? { count: stats.count, min: stats.min, max: stats.max, mean: Math.max(stats.min, Math.min(stats.max, stats.sum / stats.count)) } : null];
+  }));
+  const samples = session.samples.slice();
+  if (session.latestPoint && samples.at(-1) !== session.latestPoint) samples.push(session.latestPoint);
+  const payload = {
+    id: session.id, started_at: session.started_at, ended_at: session.ended_at || null,
+    status: session.status, revision: session.revision, duration_seconds: duration,
+    frame_count: session.frame_count, detected_frames: session.detected_frames,
+    angle_stats: angleStats, samples,
+  };
+  storeCameraSession(session, payload, Boolean(session.client));
+  return syncCameraSession(session, payload, unloading);
+}
+
+function finishCameraSession(unloading, interrupted = false) {
+  window.clearInterval(state.camera.checkpointTimer);
+  state.camera.checkpointTimer = 0;
+  const session = state.camera.session;
+  if (!session) return;
+  state.camera.session = null;
+  session.status = unloading || interrupted ? "interrupted" : "completed";
+  session.ended_at = new Date().toISOString();
+  checkpointCameraSession(session, unloading);
+  if (!unloading && !session.storageWarning) showToast("已生成检测记录", session.client ? "可在历史记录中查看；保存失败时会暂存本机" : "已保存在当前浏览器，可在历史记录中查看");
+}
+
+function matchesCameraDates(item) {
+  const date = new Date(item.started_at);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  return (!state.records.startDate || local >= state.records.startDate) && (!state.records.endDate || local <= state.records.endDate);
+}
+
+async function loadCameraHistory() {
+  const records = state.cameraRecords;
+  const requestId = records.requestId = (records.requestId || 0) + 1;
+  records.loading = true;
+  records.error = "";
+  renderApp();
+  const key = cameraStorageKey();
+  const client = newSessionClient();
+  const local = localCameraSessions(key);
+  // Recover the last checkpoint left by a refreshed or closed page.
+  for (const entry of local) {
+    if (entry.status === "recording" && entry.id !== state.camera.session?.id) {
+      entry.status = "interrupted";
+      entry.ended_at = new Date(new Date(entry.started_at).getTime() + entry.duration_seconds * 1000).toISOString();
+      entry.revision += 1;
+      entry.pending = Boolean(client);
+      storeCameraSession({ storageKey: key, client }, entry, entry.pending);
+    }
+  }
+  if (client) {
+    await Promise.all(local.filter((item) => item.pending).map((payload) => syncCameraSession({ storageKey: key, client }, payload)));
+  }
+  if (key !== cameraStorageKey() || requestId !== records.requestId) return;
+  const cached = localCameraSessions(key).filter(matchesCameraDates);
+  let all = cached;
+  try {
+    if (client) {
+      const data = await client.getCameraHistory({ start_date: state.records.startDate, end_date: state.records.endDate,
+        timezone_offset: new Date().getTimezoneOffset(), limit: records.limit, offset: records.offset });
+      if (key !== cameraStorageKey() || requestId !== records.requestId) return;
+      const pending = cached.filter((item) => item.pending && !data.sessions.some((saved) => saved.id === item.id));
+      const merged = new Map(data.sessions.map((item) => [item.id, item]));
+      for (const item of cached) {
+        const remote = merged.get(item.id);
+        if (remote && item.revision >= remote.revision) merged.set(item.id, item);
+      }
+      if (!records.offset) pending.forEach((item) => merged.set(item.id, item));
+      records.history = [...merged.values()].sort((a, b) => b.started_at.localeCompare(a.started_at));
+      records.total = data.total + pending.length;
+      records.pagingTotal = data.total;
+      all = null;
+    }
+  } catch (error) {
+    if (key !== cameraStorageKey() || requestId !== records.requestId) return;
+    records.error = error.message;
+  }
+  if (all) {
+    records.total = all.length;
+    records.pagingTotal = all.length;
+    records.history = all.slice(records.offset, records.offset + records.limit);
+  }
+  records.loading = false;
+  if (state.route === "records") renderApp();
+}
+
+function cameraSessionChart(session) {
+  const samples = session.samples || [];
+  const values = samples.flatMap((item) => [item.tilt, item.pan, item.roll]).filter((v) => typeof v === "number" && Number.isFinite(v));
+  if (!values.length) return emptyState("ScanFace", "没有有效角度数据", "本次检测没有可用的角度结果。请检查摄像头、光线与服务连接后再试。");
+  const span = Math.max(10, ...values.map(Math.abs));
+  const end = Math.max(1, session.duration_seconds);
+  const x = (t) => 52 + t / end * 620;
+  const y = (v) => 125 - v / span * 95;
+  const series = [["tilt", "俯仰", "#147d73"], ["pan", "旋转", "#326d9a"], ["roll", "侧倾", "#a97717"]];
+  return `<div class="camera-chart-legend">${series.map(([, label, color]) => `<span><i style="background:${color}"></i>${label}</span>`).join("")}</div>
+    <svg class="camera-session-chart" viewBox="0 0 700 255" role="img" aria-label="本次检测三轴角度随时间变化曲线">
+      ${[-span, 0, span].map((v) => `<line x1="52" x2="672" y1="${y(v)}" y2="${y(v)}" stroke="#dde6e3"/><text x="44" y="${y(v) + 4}" text-anchor="end">${v.toFixed(0)}°</text>`).join("")}
+      ${series.map(([axis, , color]) => {
+        let pen = false;
+        const path = samples.map((item) => {
+          if (item[axis] === null || item[axis] === undefined) { pen = false; return ""; }
+          const command = `${pen ? "L" : "M"}${x(item.elapsed).toFixed(2)},${y(item[axis]).toFixed(2)}`;
+          pen = true;
+          return command;
+        }).join(" ");
+        return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>${samples.filter((item) => item[axis] != null).map((item) => `<circle cx="${x(item.elapsed)}" cy="${y(item[axis])}" r="2" fill="${color}"/>`).join("")}`;
+      }).join("")}
+      <text x="52" y="246">0 秒</text><text x="672" y="246" text-anchor="end">${Math.round(end)} 秒</text>
+    </svg>`;
+}
+
+async function showCameraSessionDetail(id) {
+  showModal("摄像头检测详情", emptyState("RefreshCw", "正在读取检测记录", "请稍候。"), true);
+  const local = localCameraSessions().find((item) => item.id === id);
+  try {
+    let session = local;
+    if (isAuthenticated() && !local?.pending) {
+      try { session = (await api.getCameraSession(id)).session; } catch (error) { if (!local) throw error; }
+    }
+    if (!session) throw new Error("检测记录不存在");
+    updateModalBody(`<div class="camera-session-summary">
+      <div><small>检测开始</small><strong>${formatDate(session.started_at, true)}</strong></div>
+      <div><small>持续时长</small><strong>${sessionDuration(session.duration_seconds)}</strong></div>
+      <div><small>有效帧 / 检测帧</small><strong>${session.detected_frames} / ${session.frame_count}</strong></div>
+      <div><small>状态</small><strong>${cameraSessionStatus(session)}${session.pending ? " · 待同步" : ""}</strong></div>
+    </div>
+    <div class="table-wrap section"><table class="data-table"><thead><tr><th>角度</th><th>平均值</th><th>最小值</th><th>最大值</th><th>有效样本</th></tr></thead><tbody>
+      ${[["tilt", "Tilt 俯仰"], ["pan", "Pan 旋转"], ["roll", "Roll 侧倾"]].map(([axis, label]) => {
+        const stats = session.angle_stats?.[axis];
+        return `<tr><td>${label}</td>${["mean", "min", "max"].map((key) => `<td>${stats ? `${formatNumber(stats[key])}°` : "—"}</td>`).join("")}<td>${stats?.count || 0}</td></tr>`;
+      }).join("")}
+    </tbody></table></div><h3 class="section">角度变化</h3>${cameraSessionChart(session)}
+    <p class="field-hint">统计使用检测过程中已显示的角度；曲线为时间采样，长时检测会降低采样密度。未识别到的角度留空。以上为姿态记录，不代表六方向最大活动度或医学诊断。</p>`);
+  } catch (error) {
+    updateModalBody(errorState("记录读取失败", error.message));
+  }
+}
+
+function renderRecordsContent() {
+  const summary = state.records.summary || {};
+  const latest = summary.latest_assessment;
+  const latestGrade = gradeMeta(latest?.grade);
+  return `
+    <section class="section summary-grid">
+      ${summaryItem("评估总数", summary.total_assessments ?? state.records.total ?? 0, "次")}
+      ${summaryItem("最近分级", latest ? latestGrade.label : "暂无", latest ? formatDate(latest.assessment_date) : "尚无数据")}
+      ${summaryItem("最佳记录", gradeMeta(summary.best_assessment?.grade).label, summary.best_assessment ? formatDate(summary.best_assessment.assessment_date) : "尚无数据")}
+      ${summaryItem("趋势周期", state.records.trendDays, "天")}
+    </section>
+    <section class="section records-layout">
+      <div class="panel">
+        <div class="panel__header">
+          <div>
+            <h2>历史记录</h2>
+            <p>共 ${state.records.total} 条</p>
+          </div>
+        </div>
+        <div class="panel__body panel__body--flush">
+          ${renderHistoryTable()}
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel__header">
+          <div>
+            <h2>平均活动度</h2>
+            <p>所有已保存评估</p>
+          </div>
+        </div>
+        <div class="panel__body">
+          <div class="reference-list">
+            ${ANGLE_FIELDS.map((field) => {
+              const summaryKey = field.key.replace("_angle", "");
+              const value = summary.average_angles?.[summaryKey] || 0;
+              return `
+                <div class="reference-row">
+                  <div>
+                    <strong>${field.short}</strong>
+                    <div class="reference-row__bar"><span style="width:${Math.min(100, (Number(value) / field.normal) * 100)}%"></span></div>
+                  </div>
+                  <span>${formatNumber(value)}°</span>
+                </div>
+              `;
+            }).join("")}
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="section panel">
+      <div class="panel__header">
+        <div>
+          <h2>活动度趋势</h2>
+          <p>前屈、后伸与左右旋转</p>
+        </div>
+        <select class="select" data-trend-days aria-label="趋势周期">
+          ${[7, 30, 90, 180].map((days) => `<option value="${days}" ${state.records.trendDays === days ? "selected" : ""}>最近 ${days} 天</option>`).join("")}
+        </select>
+      </div>
+      ${state.records.trend?.trend?.dates?.length
+        ? `
+          <div class="chart-wrap"><canvas id="trend-chart" aria-label="活动度趋势图"></canvas></div>
+          <div class="chart-legend">
+            <span><i style="background:#13736b"></i>前屈</span>
+            <span><i style="background:#c45d3c"></i>后伸</span>
+            <span><i style="background:#326d9a"></i>左旋转</span>
+            <span><i style="background:#a97717"></i>右旋转</span>
+          </div>
+        `
+        : emptyState("TrendingUp", "暂无趋势数据", "当前时间范围内没有评估记录。")}
+    </section>
+  `;
+}
+
+function summaryItem(label, value, note) {
+  return `
+    <article class="summary-item">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value ?? "—")}</strong>
+      <small>${escapeHtml(note || "")}</small>
+    </article>
+  `;
+}
+
+function renderHistoryTable() {
+  if (!state.records.history.length) {
+    return emptyState("History", "暂无评估记录", "完成六方向评估后会出现在这里。");
+  }
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th style="width:18%">日期</th>
+            <th style="width:15%">分级</th>
+            <th style="width:17%">前屈 / 后伸</th>
+            <th style="width:22%">左右侧屈</th>
+            <th style="width:22%">左右旋转</th>
+            <th style="width:6%"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${state.records.history.map((item) => {
+            const grade = gradeMeta(item.grade);
+            return `
+              <tr data-assessment-id="${escapeAttribute(item.id)}">
+                <td><span class="table-primary">${formatDate(item.assessment_date)}</span><span class="table-secondary">#${escapeHtml(item.id)}</span></td>
+                <td><span class="status-badge status-badge--${grade.tone}">${grade.label}</span></td>
+                <td>${formatNumber(item.flexion_angle)}° / ${formatNumber(item.extension_angle)}°</td>
+                <td>${formatNumber(item.left_lateral_flexion_angle)}° / ${formatNumber(item.right_lateral_flexion_angle)}°</td>
+                <td>${formatNumber(item.left_rotation_angle)}° / ${formatNumber(item.right_rotation_angle)}°</td>
+                <td>${icon("ChevronRight", 15)}</td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>
+    <div class="pagination">
+      <span>显示 ${state.records.offset + 1} - ${Math.min(state.records.offset + state.records.history.length, state.records.total)} 条</span>
+      <div class="toolbar">
+        <button class="button button--secondary button--small" type="button" data-action="records-prev" ${state.records.offset <= 0 ? "disabled" : ""}>上一页</button>
+        <button class="button button--secondary button--small" type="button" data-action="records-next" ${state.records.offset + state.records.limit >= state.records.total ? "disabled" : ""}>下一页</button>
+      </div>
+    </div>
+  `;
+}
+
+function needsProfile(user) {
+  return Boolean(user && !(user.profile_complete ?? (user.full_name && user.age !== null && user.age !== undefined && user.gender)));
+}
+
+function renderProfile() {
+  const user = state.user || {};
+  return `
+    ${viewHeader(
+      "个人中心",
+      "维护账号资料、身体信息和症状记录。",
+      `<button class="button button--secondary" type="button" data-action="password-modal">${icon("KeyRound", 16)}修改密码</button>`
+    )}
+    ${needsProfile(user) ? `<div class="onboarding-note" role="status"><div><strong>欢迎使用，建议先完善个人资料</strong><p>建议填写：${escapeHtml((user.profile_missing_fields || ["姓名或称呼", "年龄", "性别"]).join("、"))}。不需要身份证号，手机号、身体信息及病史均为选填，也可稍后补充。</p></div><button class="button button--ghost" type="button" data-route="dashboard">稍后填写，先去自测</button></div>` : ""}
+    <div class="profile-layout">
+      <aside class="panel profile-summary">
+        <div class="avatar avatar--large">${escapeHtml(initials(user))}</div>
+        <div>
+          <h2>${escapeHtml(user.full_name || user.username)}</h2>
+          <p>@${escapeHtml(user.username)}</p>
+        </div>
+        <span class="status-badge status-badge--info">${roleLabel(user.role)}</span>
+        <div class="profile-meta">
+          <div><span>账号状态</span><strong>${user.is_active === false ? "已禁用" : "正常"}</strong></div>
+          <div><span>邮箱验证</span><strong>${user.is_verified ? "已验证" : "未验证"}</strong></div>
+          <div><span>注册时间</span><strong>${formatDate(user.created_at)}</strong></div>
+        </div>
+      </aside>
+      <section class="panel">
+        <div class="panel__header">
+          <div>
+            <h2>资料信息</h2>
+            <p>资料用于个人自测记录，可随时修改；所有字段均可稍后补充。</p>
+          </div>
+        </div>
+        <div class="panel__body">
+          <form id="profile-form">
+            <div class="form-grid">
+              ${profileField("姓名或称呼", "full_name", user.full_name, "text")}
+              ${profileField("年龄", "age", user.age, "number", "0", "120")}
+              <div class="field">
+                <label for="profile-gender">性别</label>
+                <select class="select" id="profile-gender" name="gender">
+                  <option value="">未填写</option>
+                  <option value="male" ${user.gender === "male" ? "selected" : ""}>男</option>
+                  <option value="female" ${user.gender === "female" ? "selected" : ""}>女</option>
+                  <option value="other" ${user.gender === "other" ? "selected" : ""}>其他</option>
+                </select>
+              </div>
+              ${profileField("职业", "occupation", user.occupation)}
+              ${profileField("手机号", "phone", user.phone, "tel")}
+              ${profileField("身高（cm）", "height", user.height, "number", "30", "250")}
+              ${profileField("体重（kg）", "weight", user.weight, "number", "1", "300")}
+              <div class="field field--wide">
+                <label for="profile-medical-history">既往病史</label>
+                <textarea class="textarea" id="profile-medical-history" name="medical_history" maxlength="2000" placeholder="选填">${escapeHtml(user.medical_history || "")}</textarea>
+              </div>
+              <div class="field field--wide">
+                <label for="profile-current-symptoms">当前症状</label>
+                <textarea class="textarea" id="profile-current-symptoms" name="current_symptoms" maxlength="2000" placeholder="选填">${escapeHtml(user.current_symptoms || "")}</textarea>
+              </div>
+            </div>
+            <div class="form-actions section">
+              <button class="button button--primary" type="submit">${icon("Save", 16)}保存资料</button>
+            </div>
+          </form>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function profileField(label, name, value, type = "text", min = "", max = "") {
+  return `
+    <div class="field">
+      <label for="profile-${name}">${label}</label>
+      <input class="input" id="profile-${name}" name="${name}" type="${type}" ${["height", "weight"].includes(name) ? 'step="0.1"' : ""} ${type === "text" ? `maxlength="${name === "full_name" ? 50 : 100}"` : ""} ${type === "tel" ? 'maxlength="20" pattern="[+0-9 ()\\-]{6,20}"' : ""} ${min !== "" ? `min="${min}"` : ""} ${max !== "" ? `max="${max}"` : ""} value="${escapeAttribute(value ?? "")}">
+    </div>
+  `;
+}
+
+function renderAdmin() {
+  return `
+    ${viewHeader(
+      "用户管理",
+      "查看用户构成、账号状态和用户详情。",
+      `<button class="button button--secondary" type="button" data-action="refresh-admin">${icon("RefreshCw", 16)}刷新</button>`
+    )}
+    ${state.admin.loading
+      ? `<div class="panel">${emptyState("RefreshCw", "正在读取用户数据", "请稍候。")}</div>`
+      : state.admin.error
+        ? `<div class="panel">${errorState("用户数据不可用", state.admin.error, "refresh-admin")}</div>`
+        : renderAdminContent()}
+  `;
+}
+
+function renderAdminContent() {
+  const stats = state.admin.stats || {};
+  const visibleUsers = state.admin.search
+    ? state.admin.users.filter((user) => `${user.username} ${user.full_name || ""} ${user.email || ""}`.toLowerCase().includes(state.admin.search.toLowerCase()))
+    : state.admin.users;
+  return `
+    <section class="admin-grid">
+      ${adminStat("用户总数", stats.total_users ?? 0)}
+      ${adminStat("患者", stats.patients ?? 0)}
+      ${adminStat("医生", stats.doctors ?? 0)}
+      ${adminStat("管理员", stats.admins ?? 0)}
+      ${adminStat("近七日新增", stats.recent_users ?? 0)}
+    </section>
+    <section class="section panel">
+      <div class="panel__header">
+        <div>
+          <h2>用户列表</h2>
+          <p>共 ${state.admin.total} 个账号</p>
+        </div>
+        <div class="toolbar">
+          <div class="search-field">
+            ${icon("Search", 16)}
+            <input class="input" type="search" placeholder="搜索当前页" value="${escapeAttribute(state.admin.search)}" data-admin-search>
+          </div>
+          <select class="select" data-admin-role aria-label="角色筛选">
+            <option value="">全部角色</option>
+            <option value="patient" ${state.admin.role === "patient" ? "selected" : ""}>患者</option>
+            <option value="doctor" ${state.admin.role === "doctor" ? "selected" : ""}>医生</option>
+            <option value="admin" ${state.admin.role === "admin" ? "selected" : ""}>管理员</option>
+          </select>
+        </div>
+      </div>
+      <div class="panel__body panel__body--flush">
+        ${visibleUsers.length ? `
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th style="width:28%">用户</th><th style="width:28%">邮箱</th><th style="width:16%">角色</th><th style="width:16%">状态</th><th style="width:12%">注册</th></tr></thead>
+              <tbody>
+                ${visibleUsers.map((user) => `
+                  <tr data-user-id="${escapeAttribute(user.id)}" data-admin-user-row data-search-text="${escapeAttribute(`${user.username} ${user.full_name || ""} ${user.email || ""}`.toLowerCase())}">
+                    <td><span class="table-primary">${escapeHtml(user.full_name || user.username)}</span><span class="table-secondary">@${escapeHtml(user.username)}</span></td>
+                    <td>${escapeHtml(user.email || "—")}</td>
+                    <td>${roleLabel(user.role)}</td>
+                    <td><span class="status-badge ${user.is_active === false ? "status-badge--danger" : "status-badge--success"}">${user.is_active === false ? "禁用" : "正常"}</span></td>
+                    <td>${formatDate(user.created_at)}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+          <div class="pagination">
+            <span>第 ${state.admin.page} / ${Math.max(1, state.admin.pages)} 页</span>
+            <div class="toolbar">
+              <button class="button button--secondary button--small" type="button" data-action="admin-prev" ${state.admin.page <= 1 ? "disabled" : ""}>上一页</button>
+              <button class="button button--secondary button--small" type="button" data-action="admin-next" ${state.admin.page >= state.admin.pages ? "disabled" : ""}>下一页</button>
+            </div>
+          </div>
+        ` : emptyState("Users", "当前没有匹配用户", "调整角色或搜索条件后重试。")}
+      </div>
+    </section>
+  `;
+}
+
+function adminStat(label, value) {
+  return `<article class="admin-stat"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`;
+}
+
+function renderPatients() {
+  return `
+    ${viewHeader("患者评估查询", "输入患者 ID，读取该患者最近一百条评估记录。")}
+    <section class="panel">
+      <div class="panel__body">
+        <form class="records-toolbar" id="patient-search-form">
+          <div class="field">
+            <label for="patient-id">患者 ID</label>
+            <input class="input" id="patient-id" name="patient_id" type="number" min="1" required value="${escapeAttribute(state.patients.patientId)}" placeholder="例如 12">
+          </div>
+          <button class="button button--primary" type="submit">${icon("Search", 16)}查询</button>
+        </form>
+      </div>
+    </section>
+    <section class="section panel">
+      ${state.patients.loading
+        ? emptyState("RefreshCw", "正在读取患者记录", "请稍候。")
+        : state.patients.error
+          ? errorState("查询失败", state.patients.error)
+          : state.patients.data
+            ? renderPatientResult(state.patients.data)
+            : emptyState("Stethoscope", "等待患者查询", "仅医生和管理员可以访问此数据。")}
+    </section>
+  `;
+}
+
+function renderPatientResult(data) {
+  const patient = data.patient || {};
+  const assessments = data.assessments || [];
+  return `
+    <div class="panel__header">
+      <div>
+        <h2>${escapeHtml(patient.full_name || patient.username || "患者")}</h2>
+        <p>患者 ID ${escapeHtml(patient.id || state.patients.patientId)} · ${assessments.length} 条记录</p>
+      </div>
+      <span class="status-badge status-badge--info">${escapeHtml(patient.age || "—")} 岁</span>
+    </div>
+    <div class="panel__body panel__body--flush">
+      ${assessments.length ? `
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr><th>日期</th><th>分级</th><th>前屈 / 后伸</th><th>左右旋转</th></tr></thead>
+            <tbody>
+              ${assessments.map((item) => {
+                const grade = gradeMeta(item.grade);
+                return `
+                  <tr data-assessment-id="${escapeAttribute(item.id)}">
+                    <td>${formatDate(item.assessment_date)}</td>
+                    <td><span class="status-badge status-badge--${grade.tone}">${grade.label}</span></td>
+                    <td>${formatNumber(item.flexion_angle)}° / ${formatNumber(item.extension_angle)}°</td>
+                    <td>${formatNumber(item.left_rotation_angle)}° / ${formatNumber(item.right_rotation_angle)}°</td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : emptyState("ClipboardList", "该患者暂无评估记录", "完成评估后会显示在这里。")}
+    </div>
+  `;
+}
+
+async function initialize() {
+  if (!api.token && state.user) {
+    saveUser(null);
+  }
+
+  if (api.token) {
+    try {
+      const profile = await api.getProfile();
+      saveUser(profile.user);
+      state.guest = false;
+      localStorage.removeItem("cervical_guest");
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        api.setToken("");
+        saveUser(null);
+      }
+    }
+  }
+
+  await refreshConnection({ render: false, quiet: true });
+  renderApp();
+  await loadRouteData();
+
+  window.setInterval(() => {
+    refreshConnection({ render: false, quiet: true });
+  }, 30000);
+}
+
+async function refreshConnection({ render = true, quiet = false } = {}) {
+  state.connection = "checking";
+  state.connectionMessage = "正在检查后端";
+  updateConnectionChip();
+
+  try {
+    const data = await api.getPoseStatus();
+    state.poseStatus = data.pose_model || data;
+    state.connection = "online";
+    state.connectionMessage = state.poseStatus.ready_for_inference ? "后端与模型文件正常" : "后端在线，模型文件不完整";
+  } catch (error) {
+    state.connection = "offline";
+    state.connectionMessage = error.message || "无法连接后端";
+    if (!quiet) showToast("连接失败", state.connectionMessage, "error");
+  }
+
+  if (render && !state.camera.active) {
+    renderApp();
+  } else {
+    updateConnectionChip();
+  }
+}
+
+function updateConnectionChip() {
+  const chip = document.querySelector("#connection-chip");
+  if (!chip) return;
+  chip.classList.toggle("is-online", state.connection === "online");
+  chip.classList.toggle("is-offline", state.connection === "offline");
+  chip.innerHTML = `
+    ${state.connection === "online" ? icon("Wifi", 15) : icon("WifiOff", 15)}
+    <span>${escapeHtml(state.connection === "online" ? "后端已连接" : state.connection === "checking" ? "连接检查中" : "后端未连接")}</span>
+  `;
+}
+
+async function loadRouteData() {
+  if (state.route === "dashboard") {
+    await loadDashboard();
+  } else if (state.route === "records") {
+    await loadRecords();
+  } else if (state.route === "admin") {
+    await loadAdmin();
+  }
+}
+
+async function loadDashboard() {
+  if (!isAuthenticated()) {
+    state.dashboard = { loading: false, summary: null, history: [], error: "" };
+    renderApp();
+    return;
+  }
+
+  state.dashboard.loading = true;
+  state.dashboard.error = "";
+  renderApp();
+
+  const [summaryResult, historyResult] = await Promise.allSettled([
+    api.getSummary(),
+    api.getHistory({ limit: 5, offset: 0 }),
+  ]);
+
+  state.dashboard.loading = false;
+  if (summaryResult.status === "fulfilled") {
+    state.dashboard.summary = summaryResult.value;
+  } else {
+    state.dashboard.summary = null;
+    state.dashboard.error = summaryResult.reason.message;
+  }
+
+  if (historyResult.status === "fulfilled") {
+    state.dashboard.history = historyResult.value.assessments || [];
+  } else {
+    state.dashboard.history = [];
+    state.dashboard.error ||= historyResult.reason.message;
+  }
+  renderApp();
+}
+
+async function loadRecords() {
+  if (state.records.tab === "camera" || !isAuthenticated()) {
+    await loadCameraHistory();
+    return;
+  }
+  if (!isAuthenticated()) return;
+  state.records.loading = true;
+  state.records.error = "";
+  renderApp();
+
+  const filters = {
+    start_date: state.records.startDate,
+    end_date: state.records.endDate,
+    limit: state.records.limit,
+    offset: state.records.offset,
+  };
+
+  const [historyResult, trendResult, summaryResult] = await Promise.allSettled([
+    api.getHistory(filters),
+    api.getTrend(state.records.trendDays),
+    api.getSummary(),
+  ]);
+
+  state.records.loading = false;
+  if (historyResult.status === "fulfilled") {
+    state.records.history = historyResult.value.assessments || [];
+    state.records.total = Number(historyResult.value.total || 0);
+  } else {
+    state.records.history = [];
+    state.records.total = 0;
+    state.records.error = historyResult.reason.message;
+  }
+
+  if (trendResult.status === "fulfilled") {
+    state.records.trend = trendResult.value;
+  } else {
+    state.records.trend = null;
+    state.records.error ||= trendResult.reason.message;
+  }
+
+  if (summaryResult.status === "fulfilled") {
+    state.records.summary = summaryResult.value;
+  } else {
+    state.records.summary = null;
+    state.records.error ||= summaryResult.reason.message;
+  }
+  renderApp();
+}
+
+async function loadAdmin() {
+  if (state.user?.role !== "admin") return;
+  state.admin.loading = true;
+  state.admin.error = "";
+  renderApp();
+
+  const [statsResult, usersResult] = await Promise.allSettled([
+    api.getUserStats(),
+    api.getUsers({
+      role: state.admin.role,
+      page: state.admin.page,
+      per_page: state.admin.perPage,
+    }),
+  ]);
+
+  state.admin.loading = false;
+  if (statsResult.status === "fulfilled") {
+    state.admin.stats = statsResult.value;
+  } else {
+    state.admin.stats = null;
+    state.admin.error = statsResult.reason.message;
+  }
+
+  if (usersResult.status === "fulfilled") {
+    state.admin.users = usersResult.value.users || [];
+    state.admin.total = Number(usersResult.value.total || 0);
+    state.admin.page = Number(usersResult.value.page || 1);
+    state.admin.pages = Number(usersResult.value.pages || 0);
+  } else {
+    state.admin.users = [];
+    state.admin.error ||= usersResult.reason.message;
+  }
+  renderApp();
+}
+
+function navigate(route) {
+  if (!allowedRoute(route)) {
+    if (!isAuthenticated()) {
+      exitToLogin();
+    }
+    return;
+  }
+
+  if (state.camera.active && (route !== "detection" || state.detection.tab !== "camera")) {
+    stopCamera();
+  }
+
+  state.sidebarOpen = false;
+  if (state.route === route) {
+    renderApp();
+    loadRouteData();
+    return;
+  }
+  window.location.hash = `#/${route}`;
+}
+
+async function handleRouteChange() {
+  const nextRoute = routeFromHash();
+  if (state.camera.active && nextRoute !== "detection") {
+    stopCamera();
+  }
+  state.route = nextRoute;
+  state.sidebarOpen = false;
+  normalizeRoute();
+  renderApp();
+  await loadRouteData();
+}
+
+function exitToLogin() {
+  stopCamera();
+  state.guest = false;
+  localStorage.removeItem("cervical_guest");
+  renderApp();
+}
+
+function logout() {
+  stopCamera();
+  api.setToken("");
+  saveUser(null);
+  state.guest = false;
+  localStorage.removeItem("cervical_guest");
+  state.route = "dashboard";
+  history.replaceState(null, "", "#/dashboard");
+  renderApp();
+  showToast("已退出登录", "本机登录信息已清除");
+}
+
+appElement.addEventListener("click", async (event) => {
+  const routeTarget = event.target.closest("[data-route]");
+  if (routeTarget) {
+    const route = routeTarget.dataset.route;
+    const detectionTab = routeTarget.dataset.detectionTab;
+    if (route === "records" && ["camera", "assessment"].includes(routeTarget.dataset.recordTab)) {
+      state.records.tab = routeTarget.dataset.recordTab;
+    }
+    if (route === "detection" && ["image", "camera"].includes(detectionTab)) {
+      state.detection.tab = detectionTab;
+    }
+    navigate(route);
+    return;
+  }
+
+  const recordTab = event.target.closest("[data-record-tab]");
+  if (recordTab) {
+    state.records.tab = recordTab.dataset.recordTab;
+    await loadRecords();
+    return;
+  }
+  const cameraRecord = event.target.closest("[data-camera-session-id]");
+  if (cameraRecord) {
+    await showCameraSessionDetail(cameraRecord.dataset.cameraSessionId);
+    return;
+  }
+
+  const tabTarget = event.target.closest("[data-detect-tab]");
+  if (tabTarget) {
+    const tab = tabTarget.dataset.detectTab;
+    if (state.camera.active && tab !== "camera") stopCamera();
+    state.detection.tab = tab;
+    renderApp();
+    return;
+  }
+
+  const assessmentTarget = event.target.closest("[data-assessment-id]");
+  if (assessmentTarget) {
+    await showAssessmentDetail(assessmentTarget.dataset.assessmentId);
+    return;
+  }
+
+  const userTarget = event.target.closest("[data-user-id]");
+  if (userTarget) {
+    await showUserDetail(userTarget.dataset.userId);
+    return;
+  }
+
+  const actionTarget = event.target.closest("[data-action]");
+  if (!actionTarget) return;
+  const action = actionTarget.dataset.action;
+
+  if (action === "auth-mode") {
+    captureAuthDraft();
+    state.authMode = actionTarget.dataset.mode;
+    renderApp();
+  } else if (action === "send-email-code") {
+    await handleSendEmailCode(actionTarget);
+  } else if (action === "guest") {
+    state.authDraft = { login: {}, register: {} };
+    document.querySelector("#auth-form")?.remove();
+    state.guest = true;
+    localStorage.setItem("cervical_guest", "true");
+    state.route = "dashboard";
+    history.replaceState(null, "", "#/dashboard");
+    renderApp();
+  } else if (action === "show-login" || action === "exit-guest") {
+    exitToLogin();
+  } else if (action === "logout") {
+    logout();
+  } else if (action === "settings") {
+    showSettingsModal();
+  } else if (action === "close-modal") {
+    closeModal();
+  } else if (action === "open-sidebar") {
+    state.sidebarOpen = true;
+    renderApp();
+  } else if (action === "close-sidebar") {
+    state.sidebarOpen = false;
+    renderApp();
+  } else if (action === "refresh-connection") {
+    await refreshConnection();
+  } else if (action === "refresh-dashboard") {
+    await loadDashboard();
+  } else if (action === "refresh-records") {
+    await loadRecords();
+  } else if (action === "refresh-admin") {
+    await loadAdmin();
+  } else if (action === "reset-image") {
+    resetImageDetection();
+  } else if (action === "choose-image") {
+    document.querySelector("#pose-image-input")?.click();
+  } else if (action === "toggle-camera") {
+    if (state.camera.active) stopCamera();
+    else await startCamera();
+  } else if (action === "camera-history") {
+    state.records.tab = "camera";
+    navigate("records");
+  } else if (action === "camera-records-prev" || action === "camera-records-next") {
+    state.cameraRecords.offset = Math.max(0, state.cameraRecords.offset + (action.endsWith("prev") ? -1 : 1) * state.cameraRecords.limit);
+    await loadCameraHistory();
+  } else if (action === "camera-snapshot") {
+    await processCameraFrame(true);
+  } else if (action === "import-pose") {
+    importLatestPose();
+  } else if (action === "reset-assessment") {
+    resetAssessmentAngles();
+  } else if (action === "password-modal") {
+    showPasswordModal();
+  } else if (action === "records-prev") {
+    state.records.offset = Math.max(0, state.records.offset - state.records.limit);
+    await loadRecords();
+  } else if (action === "records-next") {
+    state.records.offset += state.records.limit;
+    await loadRecords();
+  } else if (action === "admin-prev") {
+    state.admin.page = Math.max(1, state.admin.page - 1);
+    await loadAdmin();
+  } else if (action === "admin-next") {
+    state.admin.page += 1;
+    await loadAdmin();
+  } else if (action === "test-settings") {
+    await testSettingsConnection(actionTarget);
+  }
+});
+
+appElement.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  if (form.id === "auth-form") {
+    await handleAuthSubmit(form);
+  } else if (form.id === "assessment-form") {
+    await handleAssessmentSubmit(form);
+  } else if (form.id === "records-filter-form") {
+    const formData = new FormData(form);
+    state.records.startDate = formData.get("start_date") || "";
+    state.records.endDate = formData.get("end_date") || "";
+    state.records.offset = 0;
+    state.cameraRecords.offset = 0;
+    await loadRecords();
+  } else if (form.id === "profile-form") {
+    await handleProfileSubmit(form);
+  } else if (form.id === "patient-search-form") {
+    await handlePatientSearch(form);
+  }
+});
+
+modalRoot.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  if (form.id === "settings-form") {
+    const formData = new FormData(form);
+    api.configure({
+      baseUrl: formData.get("base_url"),
+      timeout: formData.get("timeout"),
+    });
+    closeModal();
+    await refreshConnection();
+    showToast("连接设置已保存", api.baseUrl);
+  } else if (form.id === "password-form") {
+    await handlePasswordSubmit(form);
+  }
+});
+
+modalRoot.addEventListener("click", async (event) => {
+  if (event.target.classList.contains("modal-backdrop") || event.target.closest('[data-action="close-modal"]')) {
+    closeModal();
+    return;
+  }
+  const testButton = event.target.closest('[data-action="test-settings"]');
+  if (testButton) {
+    await testSettingsConnection(testButton);
+  }
+});
+
+appElement.addEventListener("change", async (event) => {
+  const target = event.target;
+  if (target.id === "pose-image-input" && target.files?.[0]) {
+    await handleImageFile(target.files[0]);
+  } else if (target.matches("[data-trend-days]")) {
+    state.records.trendDays = Number(target.value);
+    await loadRecords();
+  } else if (target.matches("[data-admin-role]")) {
+    state.admin.role = target.value;
+    state.admin.page = 1;
+    await loadAdmin();
+  }
+});
+
+appElement.addEventListener("input", (event) => {
+  const target = event.target;
+  if (target.matches("[data-confidence-threshold]")) {
+    state.detection.confidenceThreshold = Number(target.value);
+    const label = target.closest(".range-control")?.querySelector("strong");
+    if (label) label.textContent = state.detection.confidenceThreshold.toFixed(2);
+  } else if (target.matches("[data-camera-fps]")) {
+    state.camera.fps = Number(target.value);
+    updateCameraFpsLabel();
+  } else if (target.matches("[data-angle-range]")) {
+    const key = target.dataset.angleRange;
+    state.assessmentForm[key] = target.value;
+    const numberInput = document.querySelector(`[data-assessment-field="${key}"]`);
+    if (numberInput) numberInput.value = target.value;
+    updateAssessmentProgress();
+  } else if (target.matches("[data-assessment-field]")) {
+    const key = target.dataset.assessmentField;
+    state.assessmentForm[key] = target.value;
+    const rangeInput = document.querySelector(`[data-angle-range="${key}"]`);
+    if (rangeInput) rangeInput.value = target.value || 0;
+    updateAssessmentProgress();
+  } else if (target.matches("[data-admin-search]")) {
+    state.admin.search = target.value;
+    document.querySelectorAll("[data-admin-user-row]").forEach((row) => {
+      row.hidden = !row.dataset.searchText.includes(state.admin.search.toLowerCase());
+    });
+  } else if (target.closest("#assessment-form") && target.name) {
+    state.assessmentForm[target.name] = target.value;
+  }
+});
+
+appElement.addEventListener("dragover", (event) => {
+  const dropzone = event.target.closest(".dropzone");
+  if (!dropzone) return;
+  event.preventDefault();
+  dropzone.classList.add("is-dragging");
+});
+
+appElement.addEventListener("dragleave", (event) => {
+  event.target.closest(".dropzone")?.classList.remove("is-dragging");
+});
+
+appElement.addEventListener("drop", async (event) => {
+  const dropzone = event.target.closest(".dropzone");
+  if (!dropzone) return;
+  event.preventDefault();
+  dropzone.classList.remove("is-dragging");
+  const file = event.dataTransfer?.files?.[0];
+  if (file) await handleImageFile(file);
+});
+
+appElement.addEventListener("keydown", (event) => {
+  if ((event.key === "Enter" || event.key === " ") && event.target.classList.contains("dropzone")) {
+    event.preventDefault();
+    document.querySelector("#pose-image-input")?.click();
+  }
+});
+
+function captureAuthDraft() {
+  const form = document.querySelector("#auth-form");
+  if (form) state.authDraft[form.dataset.mode] = Object.fromEntries(new FormData(form));
+}
+
+function authPayload(form) {
+  return {
+    username: form.elements.username.value.trim(),
+    password: form.elements.password.value,
+    ...(form.dataset.mode === "register" ? { email: form.elements.email.value.trim().toLowerCase() } : {}),
+  };
+}
+
+function authIdentity(payload) {
+  // Do not store credentials in the challenge state.
+  return `${payload.username}\n${payload.email || ""}`;
+}
+
+function validateAuthIdentity(form) {
+  for (const name of ["username", "email", "password", "confirm_password"]) {
+    const input = form.elements[name];
+    if (input && !input.reportValidity()) return false;
+  }
+  if (form.dataset.mode === "register" && form.elements.password.value !== form.elements.confirm_password.value) {
+    showAuthError("两次输入的密码不一致");
+    return false;
+  }
+  return true;
+}
+
+function showAuthError(message) {
+  const verification = state.authVerification[state.authMode];
+  verification.error = message;
+  const element = document.querySelector("#auth-error");
+  if (element) {
+    element.textContent = message;
+    element.hidden = !message;
+  }
+}
+
+function updateAuthCodeButton() {
+  const form = document.querySelector("#auth-form");
+  if (!form) return;
+  const verification = state.authVerification[form.dataset.mode];
+  const button = form.querySelector('[data-action="send-email-code"]');
+  const seconds = Math.max(0, Math.ceil(((verification.resendAt || 0) - Date.now()) / 1000));
+  button.disabled = Boolean(verification.sending || seconds);
+  button.textContent = verification.sending ? "发送中…" : seconds ? `${seconds} 秒后重发` : "获取验证码";
+  form.setAttribute("aria-busy", String(Boolean(verification.sending)));
+  const status = document.querySelector("#auth-code-status");
+  if (verification.expiresAt && verification.expiresAt <= Date.now() && verification.id) {
+    verification.id = "";
+    verification.message = "验证码已过期，请重新获取。";
+  }
+  if (status && verification.message) status.textContent = verification.message;
+}
+
+appElement.addEventListener("input", (event) => {
+  const form = event.target.closest("#auth-form");
+  if (!form) return;
+  showAuthError("");
+  if (["username", "email", "password"].includes(event.target.name)) {
+    const verification = state.authVerification[form.dataset.mode];
+    verification.id = "";
+    verification.message = "账号信息已变更，请重新获取验证码。";
+    form.elements.verification_code.value = "";
+    updateAuthCodeButton();
+  }
+});
+
+async function handleSendEmailCode(button) {
+  const form = button.closest("form");
+  if (!validateAuthIdentity(form)) return;
+  const mode = form.dataset.mode;
+  const verification = state.authVerification[mode];
+  if (verification.sending || verification.resendAt > Date.now()) return;
+  const payload = authPayload(form);
+  showAuthError("");
+  verification.sending = true;
+  updateAuthCodeButton();
+  try {
+    const result = await api.sendEmailCode({ ...payload, purpose: mode });
+    verification.resendAt = Date.now() + result.retry_after * 1000;
+    const currentForm = document.querySelector("#auth-form");
+    if (!currentForm || currentForm.dataset.mode !== mode ||
+        JSON.stringify(authPayload(currentForm)) !== JSON.stringify(payload)) {
+      verification.id = "";
+      verification.message = "验证码已发送；账号信息已变更，请等待重发后重新获取。";
+      return;
+    }
+    verification.id = result.verification_id;
+    verification.identity = authIdentity(payload);
+    verification.expiresAt = Date.now() + result.expires_in * 1000;
+    verification.message = `已发送至 ${result.email_hint}，5 分钟有效；未收到请检查垃圾邮件。`;
+    currentForm.elements.verification_code.value = "";
+    currentForm.elements.verification_code.focus();
+  } catch (error) {
+    verification.message = "验证码尚未发送成功，请稍后重试。";
+    if (error.status === 429) verification.resendAt = Date.now() + 60000;
+    if (state.authMode === mode) showAuthError(error.message);
+  } finally {
+    verification.sending = false;
+    updateAuthCodeButton();
+  }
+}
+
+async function handleAuthSubmit(form) {
+  if (!validateAuthIdentity(form) || !form.reportValidity()) return;
+  const mode = form.dataset.mode;
+  const verification = state.authVerification[mode];
+  const payload = authPayload(form);
+  if (!verification.id || verification.identity !== authIdentity(payload) || verification.expiresAt <= Date.now()) {
+    showAuthError("请先获取有效的邮箱验证码");
+    return;
+  }
+  const submitButton = form.querySelector('button[type="submit"]');
+  if (submitButton.disabled) return;
+  setButtonBusy(submitButton, true, mode === "login" ? "登录中" : "注册中");
+  showAuthError("");
+  try {
+    payload.verification_id = verification.id;
+    payload.verification_code = form.elements.verification_code.value;
+    const result = mode === "register" ? await api.register(payload) : await api.login(payload);
+    api.setToken(result.access_token);
+    saveUser(result.user);
+    state.guest = false;
+    localStorage.removeItem("cervical_guest");
+    state.authDraft = { login: {}, register: {} };
+    state.authVerification = { login: {}, register: {} };
+    form.remove(); // Clear credentials before renderApp captures the old form.
+    state.route = needsProfile(result.user) ? "profile" : "dashboard";
+    history.replaceState(null, "", `#/${state.route}`);
+    renderApp();
+    showToast(mode === "login" ? "登录成功" : "注册成功", needsProfile(result.user) ? "建议先完善个人资料，也可稍后填写" : `欢迎，${result.user.full_name || result.user.username}`);
+    await loadRouteData();
+  } catch (error) {
+    showAuthError(error.message);
+    setButtonBusy(submitButton, false);
+  }
+}
+
+window.setInterval(updateAuthCodeButton, 1000);
+
+async function handleImageFile(file) {
+  if (!file.type.startsWith("image/")) {
+    showToast("文件格式不支持", "请选择 JPG 或 PNG 图片", "warning");
+    return;
+  }
+  if (file.size > 16 * 1024 * 1024) {
+    showToast("图片过大", "单张图片不能超过 16 MB", "warning");
+    return;
+  }
+
+  if (state.detection.imagePreview) {
+    URL.revokeObjectURL(state.detection.imagePreview);
+  }
+  state.detection.imagePreview = URL.createObjectURL(file);
+  state.detection.fileName = file.name;
+  state.detection.result = null;
+  state.detection.loading = true;
+  state.detection.error = "";
+  renderApp();
+
+  try {
+    state.detection.result = await api.estimateImage(file, {
+      annotated: true,
+      confidenceThreshold: state.detection.confidenceThreshold,
+    });
+  } catch (error) {
+    state.detection.error = error.message;
+    showToast("图片检测失败", error.message, "error");
+  } finally {
+    state.detection.loading = false;
+    renderApp();
+  }
+}
+
+function resetImageDetection() {
+  if (state.detection.imagePreview) URL.revokeObjectURL(state.detection.imagePreview);
+  state.detection.imagePreview = "";
+  state.detection.fileName = "";
+  state.detection.result = null;
+  state.detection.error = "";
+  state.detection.loading = false;
+  renderApp();
+}
+
+function updateAssessmentProgress() {
+  const badge = document.querySelector(".assessment-form")?.closest(".panel")?.querySelector(".status-badge");
+  if (badge) badge.textContent = `${completedAngleCount()} / 6`;
+
+  ANGLE_FIELDS.forEach((field) => {
+    const range = document.querySelector(`[data-angle-range="${field.key}"]`);
+    const row = range?.closest(".angle-control");
+    const bar = document.querySelectorAll(".reference-row__bar span")[ANGLE_FIELDS.indexOf(field)];
+    const valueLabel = document.querySelectorAll(".reference-row > span")[ANGLE_FIELDS.indexOf(field)];
+    const value = Number(state.assessmentForm[field.key]) || 0;
+    if (bar) bar.style.width = `${Math.min(100, (value / field.normal) * 100)}%`;
+    if (valueLabel) valueLabel.textContent = value ? `${value.toFixed(1)}°` : "—";
+    row?.classList.toggle("is-complete", state.assessmentForm[field.key] !== "");
+  });
+}
+
+function importLatestPose() {
+  const angles = latestPoseAngles();
+  if (!angles) return;
+  ANGLE_FIELDS.map((field) => field.key).forEach((key) => {
+    if (angles[key] !== null && angles[key] !== undefined) {
+      state.assessmentForm[key] = angles[key];
+    }
+  });
+  renderApp();
+  const hasLateral = angles.left_lateral_flexion_angle != null
+    && angles.right_lateral_flexion_angle != null;
+  showToast(
+    "已带入最近检测",
+    hasLateral ? "已包含三轴姿态；完整活动度仍需逐方向测量" : "本帧未可靠识别双眼，左右侧屈仍需手动测量",
+    "warning"
+  );
+}
+
+function resetAssessmentAngles() {
+  ANGLE_FIELDS.forEach((field) => {
+    state.assessmentForm[field.key] = "";
+  });
+  state.lastAssessment = null;
+  renderApp();
+}
+
+async function handleAssessmentSubmit(form) {
+  const formData = new FormData(form);
+  const payload = {
+    assessment_date: formData.get("assessment_date"),
+    device_info: String(formData.get("device_info") || "").trim(),
+    app_version: state.assessmentForm.app_version,
+  };
+
+  for (const field of ANGLE_FIELDS) {
+    const rawValue = state.assessmentForm[field.key];
+    const value = Number(rawValue);
+    if (rawValue === "" || !Number.isFinite(value)) {
+      showToast("评估数据不完整", `请填写${field.label}角度`, "warning");
+      return;
+    }
+    if (value < 0 || value > field.max) {
+      showToast("角度超出范围", `${field.label}应在 0° 到 ${field.max}° 之间`, "warning");
+      return;
+    }
+    payload[field.key] = value;
+  }
+
+  const duration = Number(formData.get("assessment_duration"));
+  if (Number.isFinite(duration) && duration > 0) payload.assessment_duration = duration;
+
+  const submitButton = form.querySelector('button[type="submit"]');
+  setButtonBusy(submitButton, true, "提交中");
+  try {
+    const result = await api.submitAssessment(payload);
+    state.lastAssessment = result.assessment;
+    showToast("评估已保存", `分级结果：${gradeMeta(result.assessment?.grade).label}`);
+    renderApp();
+  } catch (error) {
+    showToast("评估提交失败", error.message, "error");
+    setButtonBusy(submitButton, false);
+  }
+}
+
+async function handleProfileSubmit(form) {
+  const submitButton = form.querySelector('button[type="submit"]');
+  setButtonBusy(submitButton, true, "保存中");
+  const formData = new FormData(form);
+  const payload = {};
+  ["full_name", "gender", "occupation", "phone", "medical_history", "current_symptoms"].forEach((key) => {
+    payload[key] = String(formData.get(key) || "").trim() || null;
+  });
+  ["age", "height", "weight"].forEach((key) => {
+    const raw = formData.get(key);
+    payload[key] = raw === "" ? null : Number(raw);
+  });
+
+  try {
+    const result = await api.updateProfile(payload);
+    saveUser(result.user);
+    showToast("资料已保存", result.user.profile_complete ? "基本资料已完善，可以开始自测" : "已保存，其他资料可稍后补充");
+    renderApp();
+  } catch (error) {
+    showToast("保存失败", error.message, "error");
+    setButtonBusy(submitButton, false);
+  }
+}
+
+async function handlePasswordSubmit(form) {
+  const formData = new FormData(form);
+  const oldPassword = String(formData.get("old_password") || "");
+  const newPassword = String(formData.get("new_password") || "");
+  const confirmPassword = String(formData.get("confirm_password") || "");
+  if (newPassword.length < 8 || newPassword.length > 128 || !/[A-Za-z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
+    showToast("请检查新密码", "需为 8–128 位，并包含英文字母和数字", "warning");
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    showToast("密码不一致", "两次输入的新密码不同", "warning");
+    return;
+  }
+
+  const button = form.querySelector('button[type="submit"]');
+  setButtonBusy(button, true, "修改中");
+  try {
+    await api.changePassword({ old_password: oldPassword, new_password: newPassword });
+    closeModal();
+    showToast("密码已修改", "下次登录请使用新密码");
+  } catch (error) {
+    showToast("密码修改失败", error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function handlePatientSearch(form) {
+  const patientId = String(new FormData(form).get("patient_id") || "").trim();
+  state.patients.patientId = patientId;
+  state.patients.loading = true;
+  state.patients.error = "";
+  state.patients.data = null;
+  renderApp();
+  try {
+    state.patients.data = await api.getPatientAssessments(patientId);
+  } catch (error) {
+    state.patients.error = error.message;
+  } finally {
+    state.patients.loading = false;
+    renderApp();
+  }
+}
+
+function setButtonBusy(button, busy, label = "") {
+  if (!button) return;
+  if (busy) {
+    button.dataset.originalHtml = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = `${icon("RefreshCw", 16, "spinner")}${escapeHtml(label)}`;
+  } else {
+    button.disabled = false;
+    if (button.dataset.originalHtml) {
+      button.innerHTML = button.dataset.originalHtml;
+      delete button.dataset.originalHtml;
+    }
+  }
+}
+
+function showSettingsModal() {
+  showModal(
+    "后端连接设置",
+    `
+      <form id="settings-form">
+        <div class="form-grid">
+          <div class="field field--wide">
+            <label for="settings-base-url">API 地址</label>
+            <input class="input" id="settings-base-url" name="base_url" type="url" required value="${escapeAttribute(api.baseUrl)}" placeholder="http://127.0.0.1:5000">
+            <p class="field-hint">填写 Flask 后端根地址，不包含 /api 路径。</p>
+          </div>
+          <div class="field field--wide">
+            <label for="settings-timeout">请求超时（毫秒）</label>
+            <input class="input" id="settings-timeout" name="timeout" type="number" min="3000" max="120000" step="1000" value="${api.timeout}">
+          </div>
+        </div>
+        <div class="form-actions section">
+          <button class="button button--secondary" type="button" data-action="test-settings">${icon("Wifi", 16)}测试连接</button>
+          <button class="button button--primary" type="submit">${icon("Save", 16)}保存设置</button>
+        </div>
+      </form>
+    `
+  );
+}
+
+async function testSettingsConnection(button) {
+  const form = modalRoot.querySelector("#settings-form");
+  if (!form) return;
+  const formData = new FormData(form);
+  const testClient = new ApiClient();
+  testClient.baseUrl = String(formData.get("base_url") || "").replace(/\/+$/, "");
+  testClient.timeout = Number(formData.get("timeout")) || 8000;
+  setButtonBusy(button, true, "测试中");
+  try {
+    const result = await testClient.getPoseStatus();
+    const ready = result.pose_model?.ready_for_inference;
+    showToast("连接成功", ready ? "后端在线，模型文件完整" : "后端在线，模型文件未就绪");
+  } catch (error) {
+    showToast("连接测试失败", error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+function showPasswordModal() {
+  showModal(
+    "修改密码",
+    `
+      <form id="password-form">
+        <div class="form-grid">
+          <div class="field field--wide">
+            <label for="old-password">当前密码</label>
+            <input class="input" id="old-password" name="old_password" type="password" autocomplete="current-password" required>
+          </div>
+          <div class="field field--wide">
+            <label for="new-password">新密码</label>
+            <input class="input" id="new-password" name="new_password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+          </div>
+          <div class="field field--wide">
+            <label for="confirm-password">确认新密码</label>
+            <input class="input" id="confirm-password" name="confirm_password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+          </div>
+        </div>
+        <div class="form-actions section">
+          <button class="button button--secondary" type="button" data-action="close-modal">取消</button>
+          <button class="button button--primary" type="submit">${icon("KeyRound", 16)}确认修改</button>
+        </div>
+      </form>
+    `
+  );
+}
+
+async function showAssessmentDetail(assessmentId) {
+  showModal("评估详情", `<div class="empty-state">${icon("RefreshCw", 26, "spinner")}<p>正在读取评估记录</p></div>`, true);
+  try {
+    const result = await api.getAssessment(assessmentId);
+    const assessment = result.assessment;
+    const grade = gradeMeta(assessment.grade);
+    updateModalBody(`
+      <div class="summary-grid">
+        ${summaryItem("评估日期", formatDate(assessment.assessment_date), `记录 #${assessment.id}`)}
+        ${summaryItem("健康分级", grade.label, assessment.grade_details || "暂无详情")}
+      </div>
+      <div class="section">
+        <div class="section-heading"><h2>六方向活动度</h2></div>
+        <div class="reference-list">
+          ${ANGLE_FIELDS.map((field) => `
+            <div class="reference-row">
+              <div>
+                <strong>${field.label}</strong>
+                <small>参考 ${field.reference}</small>
+                <div class="reference-row__bar"><span style="width:${Math.min(100, (Number(assessment[field.key]) / field.normal) * 100)}%"></span></div>
+              </div>
+              <span>${formatNumber(assessment[field.key])}°</span>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+      ${assessment.ai_recommendations ? `<div class="notice notice--info section">${icon("Info", 17)}<span>${escapeHtml(assessment.ai_recommendations)}</span></div>` : ""}
+    `);
+  } catch (error) {
+    updateModalBody(errorState("记录读取失败", error.message));
+  }
+}
+
+async function showUserDetail(userId) {
+  showModal("用户详情", `<div class="empty-state">${icon("RefreshCw", 26, "spinner")}<p>正在读取用户信息</p></div>`);
+  try {
+    const result = await api.getUser(userId);
+    const user = result.user;
+    updateModalBody(`
+      <div class="profile-summary">
+        <div class="avatar avatar--large">${escapeHtml(initials(user))}</div>
+        <div>
+          <h2>${escapeHtml(user.full_name || user.username)}</h2>
+          <p>@${escapeHtml(user.username)} · ${roleLabel(user.role)}</p>
+        </div>
+      </div>
+      <div class="form-grid section">
+        ${detailField("邮箱", user.email)}
+        ${detailField("手机号", user.phone)}
+        ${detailField("年龄", user.age)}
+        ${detailField("性别", { male: "男", female: "女", other: "其他" }[user.gender] || "—")}
+        ${detailField("职业", user.occupation)}
+        ${detailField("注册时间", formatDate(user.created_at, true))}
+      </div>
+    `);
+  } catch (error) {
+    updateModalBody(errorState("用户读取失败", error.message));
+  }
+}
+
+function detailField(label, value) {
+  return `<div class="field"><span class="field-label">${escapeHtml(label)}</span><strong>${escapeHtml(value ?? "—")}</strong></div>`;
+}
+
+function showModal(title, body, wide = false) {
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" role="presentation">
+      <section class="modal ${wide ? "modal--wide" : ""}" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <header class="modal__head">
+          <h2 id="modal-title">${escapeHtml(title)}</h2>
+          <button class="icon-button" type="button" data-action="close-modal" title="关闭">${icon("X", 18)}</button>
+        </header>
+        <div class="modal__body">${body}</div>
+      </section>
+    </div>
+  `;
+  document.body.style.overflow = "hidden";
+  window.setTimeout(() => modalRoot.querySelector(".modal__body input, .modal__body select, .modal__body textarea, .modal__body button")?.focus(), 0);
+}
+
+function updateModalBody(body) {
+  const container = modalRoot.querySelector(".modal__body");
+  if (container) container.innerHTML = body;
+}
+
+function closeModal() {
+  modalRoot.innerHTML = "";
+  document.body.style.overflow = "";
+}
+
+function showToast(title, message, tone = "success", duration = 4200) {
+  const toast = document.createElement("article");
+  toast.className = `toast ${tone === "error" ? "toast--error" : tone === "warning" ? "toast--warning" : ""}`;
+  toast.innerHTML = `
+    <span class="toast__icon">${icon(tone === "error" || tone === "warning" ? "AlertTriangle" : "Check", 18)}</span>
+    <span>
+      <strong>${escapeHtml(title)}</strong>
+      <p>${escapeHtml(message || "")}</p>
+    </span>
+    <button type="button" data-toast-close title="关闭">${icon("X", 15)}</button>
+  `;
+  toastRegion.append(toast);
+  window.setTimeout(() => toast.remove(), duration);
+}
+
+toastRegion.addEventListener("click", (event) => {
+  event.target.closest("[data-toast-close]")?.closest(".toast")?.remove();
+});
+
+async function startCamera() {
+  if (state.camera.active || state.camera.starting) return;
+  if (!navigator.mediaDevices?.getUserMedia) {
+    showToast("浏览器不支持摄像头", "请使用最新版 Chrome、Edge 或 Safari", "error");
+    return;
+  }
+
+  state.camera.starting = true;
+  const button = document.querySelector("#camera-toggle");
+  if (button) button.disabled = true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "user",
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: false,
+    });
+    const video = document.querySelector("#browser-camera");
+    if (!video) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+
+    state.camera.stream = stream;
+    state.camera.active = true;
+    state.camera.actualFps = 0;
+    state.camera.completedFrameTimes = [];
+    state.camera.lastResult = null;
+    state.camera.errorCount = 0;
+    resetCameraAngleFilter();
+    resetCameraOverlay();
+    video.srcObject = stream;
+    await video.play();
+    if (!state.camera.active || state.camera.stream !== stream) return;
+    beginCameraSession();
+    document.querySelector("#camera-empty")?.setAttribute("hidden", "");
+    updateCameraControls();
+    updateCameraFpsLabel();
+    startCameraOverlayLoop();
+    scheduleCameraFrame(150);
+  } catch (error) {
+    stopCamera();
+    showToast("无法启动摄像头", error.name === "NotAllowedError" ? "请允许浏览器访问摄像头" : error.message, "error");
+  } finally {
+    state.camera.starting = false;
+    const toggle = document.querySelector("#camera-toggle");
+    if (toggle) toggle.disabled = false;
+  }
+}
+
+function stopCamera(unloading = false, interrupted = false) {
+  finishCameraSession(unloading, interrupted);
+  if (state.camera.timer) {
+    window.clearTimeout(state.camera.timer);
+    state.camera.timer = 0;
+  }
+  state.camera.stream?.getTracks().forEach((track) => track.stop());
+  state.camera.stream = null;
+  state.camera.active = false;
+  state.camera.inFlight = false;
+  state.camera.actualFps = 0;
+  state.camera.completedFrameTimes = [];
+  resetCameraAngleFilter();
+
+  const video = document.querySelector("#browser-camera");
+  if (video) video.srcObject = null;
+  const empty = document.querySelector("#camera-empty");
+  if (empty) empty.removeAttribute("hidden");
+  resetCameraOverlay();
+  updateCameraControls();
+  updateCameraFpsLabel();
+}
+
+function updateCameraControls() {
+  const button = document.querySelector("#camera-toggle");
+  if (button) {
+    button.innerHTML = state.camera.active
+      ? `${icon("Square", 15)}停止检测`
+      : `${icon("Play", 16)}启动检测`;
+    button.classList.toggle("button--primary", !state.camera.active);
+    button.classList.toggle("button--danger", state.camera.active);
+  }
+  const snapshot = document.querySelector('[data-action="camera-snapshot"]');
+  if (snapshot) snapshot.disabled = !state.camera.active;
+}
+
+function scheduleCameraFrame(delay = null) {
+  if (!state.camera.active) return;
+  if (state.camera.timer) window.clearTimeout(state.camera.timer);
+  state.camera.timer = window.setTimeout(
+    () => {
+      state.camera.timer = 0;
+      processCameraFrame(false);
+    },
+    delay ?? Math.round(1000 / state.camera.fps)
+  );
+}
+
+async function processCameraFrame(manual = false) {
+  if (!state.camera.active || state.camera.inFlight) return;
+  if (state.camera.timer) {
+    window.clearTimeout(state.camera.timer);
+    state.camera.timer = 0;
+  }
+  const video = document.querySelector("#browser-camera");
+  if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) {
+    scheduleCameraFrame(50);
+    return;
+  }
+
+  const startedAt = performance.now();
+  const session = state.camera.session;
+  let completed = false;
+  state.camera.inFlight = true;
+  try {
+    const blob = await captureVideoFrame(video);
+    if (!state.camera.active || state.camera.session !== session) return;
+    const file = new File([blob], `camera-${Date.now()}.jpg`, { type: "image/jpeg" });
+    const rawResult = await api.estimateImage(file, {
+      annotated: false,
+      confidenceThreshold: state.detection.confidenceThreshold,
+    });
+    if (!state.camera.active || state.camera.session !== session) return;
+    const result = singleSubjectCameraResult(rawResult);
+    collectCameraSessionFrame(session, result);
+    state.camera.lastResult = result;
+    state.camera.errorCount = 0;
+    const resultPanel = document.querySelector("#pose-result-panel");
+    if (resultPanel) resultPanel.innerHTML = renderPoseResult(result);
+    updateCameraOverlay(result);
+    completed = true;
+  } catch (error) {
+    if (state.camera.session !== session) return;
+    state.camera.errorCount = (state.camera.errorCount || 0) + 1;
+    if (manual || state.camera.errorCount === 1) {
+      showToast("实时检测失败", error.message, "error");
+    }
+  } finally {
+    if (state.camera.session === session) {
+      state.camera.inFlight = false;
+      if (completed) updateCameraInferenceRate(performance.now());
+      const elapsed = performance.now() - startedAt;
+      const targetInterval = 1000 / state.camera.fps;
+      scheduleCameraFrame(Math.max(0, targetInterval - elapsed));
+    }
+  }
+}
+
+function captureVideoFrame(video) {
+  const scale = Math.min(1, CAMERA_CAPTURE_MAX_WIDTH / video.videoWidth);
+  const width = Math.max(1, Math.round(video.videoWidth * scale));
+  const height = Math.max(1, Math.round(video.videoHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext("2d", { alpha: false }).drawImage(video, 0, 0, width, height);
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("摄像头画面编码失败")), "image/jpeg", 0.72);
+  });
+}
+
+function updateCameraInferenceRate(completedAt) {
+  state.camera.completedFrameTimes.push(completedAt);
+  state.camera.completedFrameTimes = state.camera.completedFrameTimes.filter(
+    (timestamp) => timestamp >= completedAt - 1500
+  );
+  const samples = state.camera.completedFrameTimes;
+  state.camera.actualFps = samples.length > 1
+    ? ((samples.length - 1) * 1000) / (samples[samples.length - 1] - samples[0])
+    : 0;
+  updateCameraFpsLabel();
+}
+
+function cameraPrimaryDetection(result) {
+  if (result?.primary_detection?.box) return result.primary_detection;
+  return (result?.detections || []).find((item) => item?.box) || null;
+}
+
+function singleSubjectCameraResult(result) {
+  const primary = cameraPrimaryDetection(result);
+  if (!primary) {
+    if (performance.now() - state.camera.lastAngleDetectionAt > 500) {
+      resetCameraAngleFilter();
+    }
+    return {
+      ...result,
+      detection_count: 0,
+      detections: [],
+      primary_detection: null,
+      summary: {
+        ...(result?.summary || {}),
+        detection_count: 0,
+      },
+    };
+  }
+
+  const now = performance.now();
+  if (now - state.camera.lastAngleDetectionAt > 500) resetCameraAngleFilter();
+  state.camera.lastAngleDetectionAt = now;
+
+  const modelTilt = Number(primary.cervical_angles?.raw_tilt) || 0;
+  const modelPan = Number(primary.cervical_angles?.raw_pan) || 0;
+  const rawModelRoll = primary.cervical_angles?.raw_roll;
+  const parsedModelRoll = rawModelRoll === null || rawModelRoll === undefined
+    ? null
+    : Number(rawModelRoll);
+  const modelRoll = Number.isFinite(parsedModelRoll) ? parsedModelRoll : null;
+  const tilt = stabilizeCameraAngle("tilt", modelTilt);
+  const pan = stabilizeCameraAngle("pan", modelPan);
+  let roll = null;
+  if (modelRoll !== null) {
+    state.camera.lastRollDetectionAt = now;
+    roll = stabilizeCameraAngle("roll", modelRoll);
+  } else if (
+    Number.isFinite(state.camera.filteredAngles.roll)
+    && now - state.camera.lastRollDetectionAt <= CAMERA_MISS_GRACE_MS
+  ) {
+    roll = Number(state.camera.filteredAngles.roll.toFixed(2));
+  } else {
+    state.camera.angleHistory.roll = [];
+    state.camera.filteredAngles.roll = null;
+  }
+  const angles = {
+    ...(primary.cervical_angles || {}),
+    model_raw_tilt: modelTilt,
+    model_raw_pan: modelPan,
+    model_raw_roll: modelRoll,
+    raw_tilt: tilt,
+    raw_pan: pan,
+    raw_roll: roll,
+    tilt_angle: Math.abs(tilt),
+    rotation_angle: Math.abs(pan),
+    roll_angle: roll === null ? null : Math.abs(roll),
+  };
+  const assessmentAngles = {
+    ...(primary.assessment_angles || {}),
+    flexion_angle: Math.max(tilt, 0),
+    extension_angle: Math.abs(Math.min(tilt, 0)),
+    left_lateral_flexion_angle: roll === null ? null : Math.max(roll, 0),
+    right_lateral_flexion_angle: roll === null ? null : Math.abs(Math.min(roll, 0)),
+    left_rotation_angle: Math.max(pan, 0),
+    right_rotation_angle: Math.abs(Math.min(pan, 0)),
+  };
+  const health = stableCameraHealth(tilt, pan, roll, primary.health_status);
+  const stablePrimary = {
+    ...primary,
+    cervical_angles: angles,
+    assessment_angles: assessmentAngles,
+    health_status: health,
+    direction: {
+      vertical: tilt >= 0 ? "flexion" : "extension",
+      rotation: pan >= 0 ? "left_rotation" : "right_rotation",
+      lateral: roll === null ? null : roll >= 0 ? "left_lateral_flexion" : "right_lateral_flexion",
+    },
+  };
+  return {
+    ...result,
+    detection_count: 1,
+    detections: [stablePrimary],
+    primary_detection: stablePrimary,
+    summary: {
+      ...(result?.summary || {}),
+      detection_count: 1,
+      model_tilt_degrees: modelTilt,
+      model_pan_degrees: modelPan,
+      model_roll_degrees: modelRoll,
+      tilt_degrees: tilt,
+      pan_degrees: pan,
+      roll_degrees: roll,
+      tilt_abs_degrees: Math.abs(tilt),
+      pan_abs_degrees: Math.abs(pan),
+      roll_abs_degrees: roll === null ? null : Math.abs(roll),
+      max_current_angle: health.max_current_angle,
+      health_grade: health.grade,
+      health_level: health.level,
+      health_message: health.message,
+      recommendation: health.recommendation,
+      angles,
+      assessment_angles: assessmentAngles,
+      health_status: health,
+    },
+  };
+}
+
+function resetCameraAngleFilter() {
+  state.camera.angleHistory = { tilt: [], pan: [], roll: [] };
+  state.camera.filteredAngles = { tilt: null, pan: null, roll: null };
+  state.camera.lastAngleDetectionAt = 0;
+  state.camera.lastRollDetectionAt = 0;
+}
+
+function median(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function stabilizeCameraAngle(axis, rawValue) {
+  const history = state.camera.angleHistory[axis];
+  history.push(rawValue);
+  if (history.length > 5) history.shift();
+  const target = median(history);
+  const current = state.camera.filteredAngles[axis];
+  if (!Number.isFinite(current)) {
+    state.camera.filteredAngles[axis] = target;
+    return Number(target.toFixed(2));
+  }
+
+  const delta = target - current;
+  if (Math.abs(delta) < 0.35) return Number(current.toFixed(2));
+  const alpha = Math.abs(delta) >= 12 ? 0.55 : Math.abs(delta) >= 4 ? 0.3 : 0.16;
+  const step = Math.max(-6, Math.min(6, delta * alpha));
+  const next = current + step;
+  state.camera.filteredAngles[axis] = next;
+  return Number(next.toFixed(2));
+}
+
+function stableCameraHealth(tilt, pan, roll, original = {}) {
+  const values = [Math.abs(tilt), Math.abs(pan)];
+  if (Number.isFinite(roll)) values.push(Math.abs(roll));
+  const maxAngle = Math.max(...values);
+  let meta;
+  if (maxAngle <= 15) {
+    meta = {
+      grade: "normal",
+      grade_score: 1,
+      level: "正常",
+      message: "当前头颈姿态偏转较小",
+      recommendation: "继续保持自然放松姿态",
+    };
+  } else if (maxAngle <= 30) {
+    meta = {
+      grade: "mild",
+      grade_score: 2,
+      level: "轻度",
+      message: "当前头颈姿态有轻度偏转",
+      recommendation: "建议调整坐姿，避免长时间保持同一角度",
+    };
+  } else if (maxAngle <= 45) {
+    meta = {
+      grade: "moderate",
+      grade_score: 3,
+      level: "中度",
+      message: "当前头颈姿态偏转明显",
+      recommendation: "建议及时回正并休息颈部",
+    };
+  } else {
+    meta = {
+      grade: "severe",
+      grade_score: 4,
+      level: "重度",
+      message: "当前头颈姿态偏转过大",
+      recommendation: "建议停止当前动作，必要时寻求专业评估",
+    };
+  }
+  return {
+    ...original,
+    ...meta,
+    max_current_angle: Number(maxAngle.toFixed(2)),
+    basis: "基于时序稳定后的 tilt/pan/可用 roll 最大绝对角，非完整六方向医学诊断",
+  };
+}
+
+function cloneCameraDetection(detection) {
+  if (!detection) return null;
+  return {
+    ...detection,
+    box: { ...detection.box },
+    cervical_angles: { ...(detection.cervical_angles || {}) },
+  };
+}
+
+function interpolateValue(current, target, amount) {
+  const currentNumber = Number(current);
+  const targetNumber = Number(target);
+  if (!Number.isFinite(currentNumber)) return targetNumber;
+  if (!Number.isFinite(targetNumber)) return currentNumber;
+  return currentNumber + (targetNumber - currentNumber) * amount;
+}
+
+function interpolateNullableValue(current, target, amount) {
+  if (target === null || target === undefined || target === "") return null;
+  const targetNumber = Number(target);
+  if (!Number.isFinite(targetNumber)) return null;
+  if (current === null || current === undefined || current === "") return targetNumber;
+  return interpolateValue(current, targetNumber, amount);
+}
+
+function smoothCameraDetection(current, target) {
+  if (!current) return cloneCameraDetection(target);
+  const amount = 0.45;
+  const box = {};
+  ["xmin", "ymin", "xmax", "ymax"].forEach((key) => {
+    box[key] = interpolateValue(current.box?.[key], target.box?.[key], amount);
+  });
+  return {
+    ...target,
+    box,
+    cervical_angles: {
+      ...(target.cervical_angles || {}),
+      raw_tilt: interpolateValue(
+        current.cervical_angles?.raw_tilt,
+        target.cervical_angles?.raw_tilt,
+        amount
+      ),
+      raw_pan: interpolateValue(
+        current.cervical_angles?.raw_pan,
+        target.cervical_angles?.raw_pan,
+        amount
+      ),
+      raw_roll: interpolateNullableValue(
+        current.cervical_angles?.raw_roll,
+        target.cervical_angles?.raw_roll,
+        amount
+      ),
+    },
+  };
+}
+
+function updateCameraOverlay(result) {
+  state.camera.overlayResult = result;
+  const detection = cameraPrimaryDetection(result);
+  if (detection) {
+    state.camera.overlayTarget = cloneCameraDetection(detection);
+    state.camera.overlayLastDetectionAt = performance.now();
+  } else if (performance.now() - state.camera.overlayLastDetectionAt > CAMERA_MISS_GRACE_MS) {
+    state.camera.overlayTarget = null;
+  }
+}
+
+function startCameraOverlayLoop() {
+  if (state.camera.overlayFrame) window.cancelAnimationFrame(state.camera.overlayFrame);
+  const renderFrame = (timestamp) => {
+    if (!state.camera.active) {
+      state.camera.overlayFrame = 0;
+      return;
+    }
+    if (timestamp - state.camera.overlayLastDrawAt >= 1000 / CAMERA_OVERLAY_FPS) {
+      state.camera.overlayLastDrawAt = timestamp;
+      if (state.camera.overlayTarget) {
+        state.camera.overlayCurrent = smoothCameraDetection(
+          state.camera.overlayCurrent,
+          state.camera.overlayTarget
+        );
+      } else if (timestamp - state.camera.overlayLastDetectionAt > CAMERA_MISS_GRACE_MS) {
+        state.camera.overlayCurrent = null;
+      }
+      drawCurrentCameraOverlay();
+    }
+    state.camera.overlayFrame = window.requestAnimationFrame(renderFrame);
+  };
+  state.camera.overlayFrame = window.requestAnimationFrame(renderFrame);
+}
+
+function resetCameraOverlay() {
+  if (state.camera.overlayFrame) window.cancelAnimationFrame(state.camera.overlayFrame);
+  state.camera.overlayFrame = 0;
+  state.camera.overlayLastDrawAt = 0;
+  state.camera.overlayCurrent = null;
+  state.camera.overlayTarget = null;
+  state.camera.overlayResult = null;
+  state.camera.overlayLastDetectionAt = 0;
+  const canvas = document.querySelector("#camera-overlay");
+  if (canvas) canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function drawCurrentCameraOverlay() {
+  const result = state.camera.overlayResult || state.camera.lastResult;
+  if (!result) return;
+  const detections = state.camera.overlayCurrent ? [state.camera.overlayCurrent] : [];
+  drawCameraOverlay(result, detections);
+}
+
+function drawCameraOverlay(result, detections = result?.detections || []) {
+  const canvas = document.querySelector("#camera-overlay");
+  const wrap = document.querySelector("#browser-camera-wrap");
+  const frame = result?.frame;
+  if (!canvas || !wrap || !frame?.width || !frame?.height) return;
+
+  const availableWidth = wrap.clientWidth;
+  const availableHeight = wrap.clientHeight;
+  const scale = Math.min(availableWidth / frame.width, availableHeight / frame.height);
+  const displayWidth = frame.width * scale;
+  const displayHeight = frame.height * scale;
+
+  if (canvas.width !== frame.width || canvas.height !== frame.height) {
+    canvas.width = frame.width;
+    canvas.height = frame.height;
+  }
+  canvas.style.width = `${displayWidth}px`;
+  canvas.style.height = `${displayHeight}px`;
+  canvas.style.left = `${(availableWidth - displayWidth) / 2}px`;
+  canvas.style.top = `${(availableHeight - displayHeight) / 2}px`;
+  canvas.style.right = "auto";
+  canvas.style.bottom = "auto";
+
+  const context = canvas.getContext("2d");
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  detections.forEach((item, index) => {
+    const box = item.box;
+    if (!box) return;
+    const grade = item.health_status?.grade;
+    const color = grade === "severe" ? "#ef5c5c" : grade === "moderate" ? "#f08b4b" : grade === "mild" ? "#e1b34b" : "#41c184";
+    const width = box.xmax - box.xmin;
+    const height = box.ymax - box.ymin;
+    context.strokeStyle = color;
+    context.lineWidth = 2;
+    context.strokeRect(box.xmin, box.ymin, width, height);
+    context.font = "600 14px Segoe UI, Microsoft YaHei, sans-serif";
+    const rawRoll = item.cervical_angles?.raw_roll;
+    const rollLabel = rawRoll == null ? "—" : `${formatNumber(rawRoll)}°`;
+    const label = `${index + 1}  T ${formatNumber(item.cervical_angles?.raw_tilt)}°  P ${formatNumber(item.cervical_angles?.raw_pan)}°  R ${rollLabel}`;
+    const labelWidth = context.measureText(label).width + 12;
+    const labelY = Math.max(20, box.ymin);
+    context.fillStyle = "rgba(17, 24, 23, 0.82)";
+    context.fillRect(box.xmin, labelY - 20, labelWidth, 20);
+    context.fillStyle = "#ffffff";
+    context.fillText(label, box.xmin + 6, labelY - 5);
+  });
+}
+
+function drawTrendChart() {
+  const canvas = document.querySelector("#trend-chart");
+  const trend = state.records.trend?.trend;
+  if (!canvas || !trend?.dates?.length) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+  const width = Math.max(320, rect.width);
+  const height = 280;
+  canvas.width = Math.round(width * pixelRatio);
+  canvas.height = Math.round(height * pixelRatio);
+  const context = canvas.getContext("2d");
+  context.scale(pixelRatio, pixelRatio);
+  context.clearRect(0, 0, width, height);
+
+  const margin = { top: 16, right: 18, bottom: 36, left: 42 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const maxValue = 90;
+  const dates = trend.dates;
+
+  context.font = "11px Segoe UI, Microsoft YaHei, sans-serif";
+  context.strokeStyle = "#d9e1de";
+  context.fillStyle = "#68736f";
+  context.lineWidth = 1;
+  [0, 30, 60, 90].forEach((value) => {
+    const y = margin.top + plotHeight - (value / maxValue) * plotHeight;
+    context.beginPath();
+    context.moveTo(margin.left, y);
+    context.lineTo(width - margin.right, y);
+    context.stroke();
+    context.fillText(`${value}°`, 8, y + 4);
+  });
+
+  const labelIndexes = [...new Set([0, Math.floor((dates.length - 1) / 2), dates.length - 1])];
+  labelIndexes.forEach((index) => {
+    const x = dates.length === 1
+      ? margin.left + plotWidth / 2
+      : margin.left + (index / (dates.length - 1)) * plotWidth;
+    const label = String(dates[index] || "").slice(5);
+    const textWidth = context.measureText(label).width;
+    context.fillText(label, Math.max(margin.left, Math.min(x - textWidth / 2, width - margin.right - textWidth)), height - 12);
+  });
+
+  const series = [
+    { values: trend.angles?.flexion || [], color: "#13736b" },
+    { values: trend.angles?.extension || [], color: "#c45d3c" },
+    { values: trend.angles?.left_rotation || [], color: "#326d9a" },
+    { values: trend.angles?.right_rotation || [], color: "#a97717" },
+  ];
+
+  series.forEach(({ values, color }) => {
+    context.beginPath();
+    context.strokeStyle = color;
+    context.lineWidth = 2;
+    values.forEach((rawValue, index) => {
+      const value = Math.max(0, Math.min(maxValue, Number(rawValue) || 0));
+      const x = dates.length === 1
+        ? margin.left + plotWidth / 2
+        : margin.left + (index / (dates.length - 1)) * plotWidth;
+      const y = margin.top + plotHeight - (value / maxValue) * plotHeight;
+      if (index === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    });
+    context.stroke();
+
+    values.forEach((rawValue, index) => {
+      const value = Math.max(0, Math.min(maxValue, Number(rawValue) || 0));
+      const x = dates.length === 1
+        ? margin.left + plotWidth / 2
+        : margin.left + (index / (dates.length - 1)) * plotWidth;
+      const y = margin.top + plotHeight - (value / maxValue) * plotHeight;
+      context.beginPath();
+      context.fillStyle = "#ffffff";
+      context.strokeStyle = color;
+      context.arc(x, y, 3, 0, Math.PI * 2);
+      context.fill();
+      context.stroke();
+    });
+  });
+}
+
+window.addEventListener("hashchange", handleRouteChange);
+window.addEventListener("resize", () => {
+  if (state.route === "records") drawTrendChart();
+  if (state.camera.active && state.camera.lastResult) drawCurrentCameraOverlay();
+});
+window.addEventListener("beforeunload", () => {
+  stopCamera(true);
+  if (state.detection.imagePreview) URL.revokeObjectURL(state.detection.imagePreview);
+});
+window.addEventListener("pagehide", () => stopCamera(true));
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    if (modalRoot.innerHTML) closeModal();
+    else if (state.sidebarOpen) {
+      state.sidebarOpen = false;
+      renderApp();
+    }
+  }
+});
+
+initialize();

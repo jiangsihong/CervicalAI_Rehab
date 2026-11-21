@@ -1,0 +1,36 @@
+# Backend runtime pinned for the local Anaconda realheponet environment.
+# Python 3.7 + TensorFlow 1.15 is required by headpose_final/pose-estimator.h5.
+
+# Flask framework
+Flask==2.2.5
+Flask-SQLAlchemy==3.0.5
+Flask-Migrate==4.0.5
+Flask-JWT-Extended==4.5.3
+Flask-Cors==4.0.0
+
+# Database
+PyMySQL==1.1.0
+SQLAlchemy==2.0.51
+cryptography<42
+
+# Data and AI
+numpy==1.18.1
+pandas==1.0.1
+scikit-learn==0.22.2
+tensorflow==1.15.0
+opencv-python==4.2.0.32
+Pillow==7.0.0
+
+# Utilities
+python-dotenv==1.0.0
+Werkzeug==2.2.3
+Jinja2==3.1.2
+click==8.1.7
+requests==2.31.0
+python-dateutil==2.8.2
+PyJWT==2.8.0
+
+# Development
+pytest==7.4.3
+black==23.9.1
+flake8==5.0.4

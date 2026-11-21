@@ -1,0 +1,23 @@
+# Local credentials and runtime files
+backend/.env
+backend/.env.*
+!backend/.env.example
+**/__pycache__/
+*.pyc
+
+# Runtime data and local environments
+backend/logs/
+backend/uploads/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.venv/
+venv/
+node_modules/
+.pytest_cache/
+.DS_Store
+Thumbs.db
+
+# Reconstructed from versioned parts; see the model directory.
+backend/ml/model_weights/headpose/*.h5
